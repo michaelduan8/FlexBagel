@@ -2,7 +2,8 @@ import argparse
 import logging
 import numpy as np
 import torch
-from transformers import Qwen2ForCausalLM, Qwen2MoeForCausalLM, Qwen2Config, Qwen2MoeConfig
+from modeling.qwen2 import Qwen2ForCausalLM, Qwen2Config
+from modeling.qwen2_moe import Qwen2MoeForCausalLM, Qwen2MoeConfig
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
