@@ -245,6 +245,8 @@ def main():
 
             # Shared expert gate — seed with embedding if provided
             if ".mlp.shared_expert_gate.weight" in key:
+                raise KeyError("Shared expert gate is disabled in this version. Remove this check if you want to enable it.")
+                
                 if shared_gate_weight is not None:
                     target_dtype = moe_sd[key].dtype
                     moe_sd[key] = shared_gate_weight.to(target_dtype)
@@ -255,6 +257,8 @@ def main():
 
             # Shared expert FFN
             if ".mlp.shared_expert." in key:
+                raise KeyError("Shared expert FFN is disabled in this version. Remove this check if you want to enable it.")
+                
                 dense_key = key.replace(".mlp.shared_expert.", ".mlp.")
                 if dense_key in dense_sds[0]:
                     if args.shared_expert_init == "mean":
@@ -293,7 +297,8 @@ def main():
         log.warning(f"Unexpected keys: {unexpected}")
 
     log.info(f"Saving to {args.target} ...")
-    moe_model.save_pretrained(args.target)
+    moe_model = moe_model.to(torch.bfloat16)
+    moe_model.save_pretrained(args.target, safe_serialization=True)
     moe_config.save_pretrained(args.target)
     log.info("Done.")
 
