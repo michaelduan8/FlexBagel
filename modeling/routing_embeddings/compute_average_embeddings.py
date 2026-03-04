@@ -16,11 +16,15 @@ Example:
 import argparse
 import json
 import os
-from typing import List, Optional, Tuple
+import psutil
 
 import numpy as np
 import torch
+
 from transformers import AutoModel, AutoTokenizer
+from typing import List, Optional, Tuple
+from tqdm import tqdm
+from vllm import LLM, PoolingParams
 
 
 def read_jsonl_texts(path: str, text_field: str) -> List[str]:
@@ -53,7 +57,7 @@ def read_jsonl_texts(path: str, text_field: str) -> List[str]:
 
 
 @torch.no_grad()
-def embed_texts(
+def embed_hf(
     texts: List[str],
     model_name: str,
     batch_size: int,
@@ -116,29 +120,113 @@ def embed_texts(
     return np.concatenate(all_embs, axis=0)
 
 
+def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", batch_size=64, instruction="{er}", mrl=None):
+    # TODO: only supports vllm embedding right now
+    embed_file = os.path.join(cache_dir, "embeddings.npy")
+    embedder = LLM(
+        model=model,
+        task="embed",
+        enforce_eager=True
+    )
+
+    extra_args = {}
+    if mrl:
+        extra_args["pooling_params"] = PoolingParams(dimensions=mrl)
+
+    # Get virtual memory information
+    mem_info = psutil.virtual_memory()
+
+    # Calculate total and available RAM in GB
+    total_ram_gb = mem_info.total / (1024**3)
+    available_ram_gb = mem_info.available / (1024**3)
+    used_ram_gb = mem_info.used / (1024**3)
+
+    print(f"Total RAM: {total_ram_gb:.2f} GB")
+    print(f"Used RAM: {used_ram_gb:.2f} GB")
+    print(f"Available RAM: {available_ram_gb:.2f} GB")
+
+    # TODO: make this toggle-able
+    if True:
+        # prepend clustering tag for nomic clustering
+        print(embed_requests[0])
+        embed_requests = [instruction.format(er=er) for er in tqdm(embed_requests)]
+
+    embeddings_memmap = None
+    if os.path.exists(embed_file):
+        # Get embedding size from output
+        test_embedding = embedder.embed(embed_requests[:1], **extra_args)
+        embedding_size = len(test_embedding[0].outputs.embedding)
+        output_shape = (len(embed_requests), embedding_size)
+        embeddings_memmap = np.memmap(embed_file, dtype='float32', mode='r', shape=output_shape)
+    else:
+        print("generating from scratch")
+        # Process passages in batches
+        for i in tqdm(range(0, len(embed_requests), batch_size)):
+            batch = embed_requests[i:i + batch_size]
+            
+            batch_out = embedder.embed(batch, **extra_args)
+            batch_embed = np.array([o.outputs.embedding for o in batch_out])
+
+            if embeddings_memmap is None:
+                # Instantiate embeddings map with length of corpus and shape of embedding
+                embed_shape = batch_embed.shape
+                print(f"Embed shape: {batch_embed.shape}")
+                output_shape = (len(embed_requests), embed_shape[1])
+                print(f"Output shape: {output_shape}")
+                embeddings_memmap = np.memmap(embed_file, dtype='float32', mode='w+', shape=output_shape)
+
+            # Move embeddings to CPU and convert to numpy
+            embeddings_memmap[i:i + len(batch)] = batch_embed
+            embeddings_memmap.flush()
+
+            assert np.all(np.equal(batch_embed[0], embeddings_memmap[i]))
+
+    embedder.llm_engine.engine_core.shutdown()
+    del embedder
+    
+    return embeddings_memmap
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="Path to input JSONL.")
     ap.add_argument("--text-field", default="text", help="JSON field that contains text.")
     ap.add_argument("--model", default="GritLM/GritLM-7B", help="HF model name/path.")
+    ap.add_argument("--mode", default="vllm", help="What framework to run embedding inference in")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--max-length", type=int, default=2048)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp32")
+    ap.add_argument("--mrl", default=None, type=int, help="Optional dimension size if MRL supported.")
     ap.add_argument("--out-embs", default=None, help="Optional .npy path to save per-item embeddings.")
     ap.add_argument("--out-avg", default=None, help="Optional .npy path to save average embedding.")
     ap.add_argument("--no-normalize-avg", action="store_true", help="Do not L2-normalize the average vector.")
     args = ap.parse_args()
 
     texts = read_jsonl_texts(args.input, args.text_field)
-    embs = embed_texts(
-        texts=texts,
-        model_name=args.model,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        device=args.device,
-        dtype=args.dtype,
-    )
+
+    if args.mode == "vllm":
+        instruction = ""
+        embs = embed_vllm(
+            embed_requests=texts,
+            # TODO: A little hacky, need to clean up
+            cache_dir=os.path.dirname(args.out_embs),
+            model=args.model,
+            batch_size=args.batch_size,
+            instruction=instruction,
+            mrl=args.mrl,
+        )
+    elif args.mode == "hf":
+        embs = embed_hf(
+            texts=texts,
+            model_name=args.model,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            device=args.device,
+            dtype=args.dtype,
+        )
+    else:
+        raise ValueError(f"Unsupported embedding mode: {args.mode}")
 
     avg = embs.mean(axis=0)  # average across samples
     if not args.no_normalize_avg:
