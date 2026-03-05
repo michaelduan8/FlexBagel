@@ -124,15 +124,17 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
     # TODO: only supports vllm embedding right now
     os.makedirs(cache_dir, exist_ok=True)
     embed_file = os.path.join(cache_dir, "embeddings.npy")
-    extra_args = {}
+    extra_llm_args = {}
+    extra_pooling_args = {}
     if mrl:
-        extra_args["hf_overrides"] = {"is_matryoshka": True, "matryoshka_dimensions": [mrl]}
+        extra_llm_args["hf_overrides"] = {"is_matryoshka": True}
+        extra_pooling_args["pooling_params"] = PoolingParams(dimensions=32)
 
     embedder = LLM(
         model=model,
         task="embed",
         enforce_eager=True,
-        **extra_args
+        **extra_llm_args
     )
 
     # Get virtual memory information
@@ -156,7 +158,7 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
     embeddings_memmap = None
     if os.path.exists(embed_file):
         # Get embedding size from output
-        test_embedding = embedder.embed(embed_requests[:1])
+        test_embedding = embedder.embed(embed_requests[:1], **extra_pooling_args)
         embedding_size = len(test_embedding[0].outputs.embedding)
         output_shape = (len(embed_requests), embedding_size)
         embeddings_memmap = np.memmap(embed_file, dtype='float32', mode='r', shape=output_shape)
@@ -166,7 +168,7 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
         for i in tqdm(range(0, len(embed_requests), batch_size)):
             batch = embed_requests[i:i + batch_size]
             
-            batch_out = embedder.embed(batch)
+            batch_out = embedder.embed(batch, **extra_pooling_args)
             batch_embed = np.array([o.outputs.embedding for o in batch_out])
 
             if embeddings_memmap is None:
