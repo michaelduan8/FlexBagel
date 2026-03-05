@@ -210,14 +210,14 @@ def main():
     texts = read_jsonl_texts(args.input, args.text_field)
 
     if args.mode == "vllm":
-        instruction = ""
+        # instruction = ""
         embs = embed_vllm(
             embed_requests=texts,
             # TODO: A little hacky, need to clean up
             cache_dir=os.path.dirname(args.out_embs),
             model=args.model,
             batch_size=args.batch_size,
-            instruction=instruction,
+            # instruction=instruction,
             mrl=args.mrl,
         )
     elif args.mode == "hf":
