@@ -155,7 +155,7 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
     embeddings_memmap = None
     if os.path.exists(embed_file):
         # Get embedding size from output
-        test_embedding = embedder.embed(embed_requests[:1], **extra_args)
+        test_embedding = embedder.embed(embed_requests[:1])
         embedding_size = len(test_embedding[0].outputs.embedding)
         output_shape = (len(embed_requests), embedding_size)
         embeddings_memmap = np.memmap(embed_file, dtype='float32', mode='r', shape=output_shape)
@@ -165,7 +165,7 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
         for i in tqdm(range(0, len(embed_requests), batch_size)):
             batch = embed_requests[i:i + batch_size]
             
-            batch_out = embedder.embed(batch, **extra_args)
+            batch_out = embedder.embed(batch)
             batch_embed = np.array([o.outputs.embedding for o in batch_out])
 
             if embeddings_memmap is None:
