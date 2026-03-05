@@ -43,6 +43,7 @@ Usage (via JSON config file):
 
 import argparse
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -275,6 +276,7 @@ def main():
     print(f"\nTotal samples: {len(samples)}")
 
     if output:
+        os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
         with open(output, "w", encoding="utf-8") as f:
             for record in samples:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
