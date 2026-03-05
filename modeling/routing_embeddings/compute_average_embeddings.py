@@ -126,7 +126,7 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
     embed_file = os.path.join(cache_dir, "embeddings.npy")
     extra_args = {}
     if mrl:
-        extra_args["hf_overrides"] = {"matryoshka_dimensions": [mrl]}
+        extra_args["hf_overrides"] = {"is_matryoshka": True, "matryoshka_dimensions": [mrl]}
 
     embedder = LLM(
         model=model,
