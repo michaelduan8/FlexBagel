@@ -128,7 +128,7 @@ def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", bat
     extra_pooling_args = {}
     if mrl:
         extra_llm_args["hf_overrides"] = {"is_matryoshka": True}
-        extra_pooling_args["pooling_params"] = PoolingParams(dimensions=32)
+        extra_pooling_args["pooling_params"] = PoolingParams(dimensions=mrl)
 
     embedder = LLM(
         model=model,
@@ -241,10 +241,11 @@ def main():
     print(f"Embeddings shape: {embs.shape} (N, hidden)")
     print(f"Average embedding shape: {avg.shape} (hidden,)")
 
-    if args.out_embs:
-        os.makedirs(os.path.dirname(args.out_embs) or ".", exist_ok=True)
-        np.save(args.out_embs, embs)
-        print(f"Saved embeddings to: {args.out_embs}")
+    # TODO: we should just save this during the embedding function for caching
+    # if args.out_embs:
+    #     os.makedirs(os.path.dirname(args.out_embs) or ".", exist_ok=True)
+    #     np.save(args.out_embs, embs)
+    #     print(f"Saved embeddings to: {args.out_embs}")
 
     if args.out_avg:
         os.makedirs(os.path.dirname(args.out_avg) or ".", exist_ok=True)
