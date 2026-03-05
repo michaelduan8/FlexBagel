@@ -122,6 +122,7 @@ def embed_hf(
 
 def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", batch_size=64, instruction="{er}", mrl=None):
     # TODO: only supports vllm embedding right now
+    os.makedirs(cache_dir, exist_ok=True)
     embed_file = os.path.join(cache_dir, "embeddings.npy")
     extra_args = {}
     if mrl:
