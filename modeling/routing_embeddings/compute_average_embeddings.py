@@ -123,15 +123,16 @@ def embed_hf(
 def embed_vllm(embed_requests, cache_dir, model="Qwen/Qwen3-Embedding-0.6B", batch_size=64, instruction="{er}", mrl=None):
     # TODO: only supports vllm embedding right now
     embed_file = os.path.join(cache_dir, "embeddings.npy")
+    extra_args = {}
+    if mrl:
+        extra_args["hf_overrides"] = {"matryoshka_dimensions": [mrl]}
+
     embedder = LLM(
         model=model,
         task="embed",
-        enforce_eager=True
+        enforce_eager=True,
+        **extra_args
     )
-
-    extra_args = {}
-    if mrl:
-        extra_args["pooling_params"] = PoolingParams(dimensions=mrl)
 
     # Get virtual memory information
     mem_info = psutil.virtual_memory()
