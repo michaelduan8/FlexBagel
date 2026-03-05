@@ -1,101 +1,289 @@
 """
-Sample n random examples from a HuggingFace dataset repo.
+Sample n random examples from one or more HuggingFace dataset repos and mix them together.
+Optionally format each sampled row into a "doc" column using a per-dataset template.
 
-Usage:
-    python sample_hf_dataset.py --repo <repo_id> --n <num_samples> [options]
+Usage (single dataset):
+    python sample_hf_dataset.py \
+        --repos stanfordnlp/imdb \
+        --n 100
 
-Examples:
-    python sample_hf_dataset.py --repo stanfordnlp/imdb --n 100
-    python sample_hf_dataset.py --repo stanfordnlp/imdb --n 50 --split test --seed 42
-    python sample_hf_dataset.py --repo allenai/c4 --n 20 --split train --config en --output samples.json
+Usage (multiple datasets, mixed):
+    python sample_hf_dataset.py \
+        --repos stanfordnlp/imdb rajpurkar/squad \
+        --n 50 50 \
+        --splits test validation \
+        --doc-templates "{text} [label={label}]" "Q: {question} A: {answers[text][0]}"
+
+Usage (via JSON config file):
+    python sample_hf_dataset.py --config-file my_config.json
+
+--- JSON config schema ---
+{
+  "seed": 42,
+  "output": "out.jsonl",
+  "streaming": false,
+  "datasets": [
+    {
+      "repo": "stanfordnlp/imdb",
+      "n": 50,
+      "split": "test",
+      "config": null,
+      "doc_template": "{text} [label={label}]"
+    },
+    {
+      "repo": "rajpurkar/squad",
+      "n": 50,
+      "split": "validation",
+      "config": null,
+      "doc_template": "Q: {question}\nContext: {context}\nA: {answers[text][0]}"
+    }
+  ]
+}
 """
 
 import argparse
 import json
 import random
-
+import re
+from dataclasses import dataclass
 from datasets import load_dataset
 
 
-def sample_dataset(
-    repo: str,
-    n: int,
-    split: str = "train",
-    config: str | None = None,
-    seed: int | None = None,
-    output: str | None = None,
-    streaming: bool = False,
-) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Template rendering
+# ---------------------------------------------------------------------------
+
+def _resolve_path(obj, path: str):
     """
-    Load a HuggingFace dataset and return n random samples.
-
-    Args:
-        repo:      HuggingFace dataset repo ID (e.g. 'stanfordnlp/imdb')
-        n:         Number of samples to draw
-        split:     Dataset split to use (default: 'train')
-        config:    Dataset config/subset name, if required
-        seed:      Random seed for reproducibility
-        output:    If provided, save samples to this JSON file
-        streaming: Use streaming mode (useful for very large datasets)
-
-    Returns:
-        List of sampled examples as dicts
+    Resolve a dotted / indexed path like "answers[text][0]" against a dict.
+    Supports:  key, key.subkey, key[subkey], key[index]
     """
-    print(f"Loading '{repo}' (split='{split}'{f', config={config!r}' if config else ''}) ...")
+    tokens = re.split(r'\.|\[|\]', path)
+    tokens = [t for t in tokens if t != '']
+    for token in tokens:
+        if isinstance(obj, dict):
+            obj = obj[token]
+        elif isinstance(obj, (list, tuple)):
+            obj = obj[int(token)]
+        else:
+            raise KeyError(f"Cannot index into {type(obj)} with key '{token}'")
+    return obj
 
-    if streaming:
-        # Streaming: shuffle a buffer and take n items — avoids downloading the full dataset
-        ds = load_dataset(repo, config, split=split, streaming=True)
-        buffer_size = max(n * 10, 10_000)
+
+def render_template(template: str, row: dict) -> str:
+    """
+    Render a template string against a dataset row dict.
+
+    Supports:
+      {column}              — simple column lookup
+      {column.subkey}       — nested dict access
+      {column[subkey][0]}   — nested dict + list index
+    """
+    def replacer(match):
+        path = match.group(1)
+        try:
+            value = _resolve_path(row, path)
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError(
+                f"Template field '{path}' not found in row. "
+                f"Available keys: {list(row.keys())}"
+            ) from e
+        return str(value)
+
+    return re.sub(r'\{([^}]+)\}', replacer, template)
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DatasetConfig:
+    repo: str
+    n: int
+    split: str = "train"
+    config: str | None = None
+    doc_template: str | None = None
+    streaming: bool = False
+
+    @staticmethod
+    def from_dict(d: dict) -> "DatasetConfig":
+        return DatasetConfig(
+            repo=d["repo"],
+            n=d["n"],
+            split=d.get("split", "train"),
+            config=d.get("config", None),
+            doc_template=d.get("doc_template", None),
+            streaming=d.get("streaming", False),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Core sampling logic
+# ---------------------------------------------------------------------------
+
+def sample_one(cfg: DatasetConfig, seed: int | None) -> list[dict]:
+    """Load a single dataset and return cfg.n random samples as plain dicts."""
+    label = f"'{cfg.repo}'" + (f" ({cfg.config})" if cfg.config else "")
+    print(f"  Loading {label} split='{cfg.split}' n={cfg.n} ...")
+
+    if cfg.streaming:
+        ds = load_dataset(cfg.repo, cfg.config, split=cfg.split, streaming=True)
+        buffer_size = max(cfg.n * 10, 10_000)
         ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
-        samples = [example for _, example in zip(range(n), ds)]
+        samples = [dict(example) for _, example in zip(range(cfg.n), ds)]
     else:
-        ds = load_dataset(repo, config, split=split)
+        ds = load_dataset(cfg.repo, cfg.config, split=cfg.split)
         total = len(ds)
-        if n > total:
-            print(f"Warning: requested {n} samples but dataset only has {total}. Returning all.")
-            n = total
-
+        if cfg.n > total:
+            print(f"  Warning: requested {cfg.n} but '{cfg.repo}' only has {total}. Using all.")
+            cfg.n = total
         rng = random.Random(seed)
-        indices = rng.sample(range(total), n)
+        indices = rng.sample(range(total), cfg.n)
         samples = [dict(ds[i]) for i in sorted(indices)]
 
-    print(f"Sampled {len(samples)} example(s).")
+    # Build output records: {id, doc}
+    dataset_slug = re.sub(r'[^a-z0-9]+', '_', cfg.repo.lower()).strip('_')
+    records = []
+    for idx, row in enumerate(samples):
+        doc = render_template(cfg.doc_template, row) if cfg.doc_template is not None else ""
+        records.append({
+            "id": f"{dataset_slug}_{idx}",
+            "doc": doc,
+        })
+
+    print(f"  Sampled {len(records)} row(s) from {label}.")
+    return records
+
+
+def sample_and_mix(
+    dataset_configs: list[DatasetConfig],
+    seed: int | None = None,
+    shuffle_output: bool = True,
+) -> list[dict]:
+    """Sample from each dataset config and mix (concatenate + optionally shuffle) results."""
+    all_samples: list[dict] = []
+    for cfg in dataset_configs:
+        all_samples.extend(sample_one(cfg, seed=seed))
+
+    if shuffle_output and len(dataset_configs) > 1:
+        rng = random.Random(seed)
+        rng.shuffle(all_samples)
+
+    return all_samples
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def build_configs_from_args(args) -> list[DatasetConfig]:
+    repos = args.repos
+    ns = args.n
+    splits = args.splits or ["train"] * len(repos)
+    configs = args.configs or [None] * len(repos)
+    templates = args.doc_templates or [None] * len(repos)
+
+    # Broadcast single value to all datasets
+    if len(ns) == 1:        ns = ns * len(repos)
+    if len(splits) == 1:    splits = splits * len(repos)
+    if len(configs) == 1:   configs = configs * len(repos)
+    if len(templates) == 1: templates = templates * len(repos)
+
+    lengths = {
+        "repos": len(repos), "n": len(ns), "splits": len(splits),
+        "configs": len(configs), "doc_templates": len(templates),
+    }
+    if len(set(lengths.values())) != 1:
+        raise ValueError(
+            f"All list arguments must have the same length (or length 1). Got: {lengths}"
+        )
+
+    return [
+        DatasetConfig(
+            repo=repo, n=n, split=split, config=cfg,
+            doc_template=tmpl, streaming=args.streaming,
+        )
+        for repo, n, split, cfg, tmpl in zip(repos, ns, splits, configs, templates)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sample and mix rows from one or more HuggingFace datasets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    # --- source spec (mutually exclusive: CLI flags vs JSON config file) ---
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--repos", nargs="+", metavar="REPO",
+                     help="One or more HuggingFace repo IDs")
+    src.add_argument("--config-file", metavar="FILE",
+                     help="JSON file describing datasets (see schema in module docstring)")
+
+    # --- per-dataset options (parallel lists, or single value broadcast) ---
+    parser.add_argument("--n", nargs="+", type=int, metavar="N",
+                        help="Number of samples per dataset (single value broadcasts to all)")
+    parser.add_argument("--splits", nargs="+", metavar="SPLIT",
+                        help="Split per dataset (default: train)")
+    parser.add_argument("--configs", nargs="+", metavar="CONFIG",
+                        help="HF config/subset name per dataset")
+    parser.add_argument("--doc-templates", nargs="+", metavar="TMPL",
+                        help='Format template per dataset, e.g. "{title}: {body}"')
+
+    # --- global options ---
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Use streaming mode for all datasets")
+    parser.add_argument("--no-shuffle", action="store_true",
+                        help="Keep samples grouped by source instead of interleaving")
+    parser.add_argument("--output", default=None,
+                        help='Save mixed samples to this JSONL file (one {"id","doc"} per line)')
+    parser.add_argument("--preview", action="store_true",
+                        help="Print a preview of the first 3 samples")
+
+    args = parser.parse_args()
+
+    # --- build dataset configs ---
+    if args.config_file:
+        with open(args.config_file) as f:
+            cfg_data = json.load(f)
+        dataset_configs = [DatasetConfig.from_dict(d) for d in cfg_data["datasets"]]
+        seed   = cfg_data.get("seed", args.seed)
+        output = cfg_data.get("output", args.output)
+        if cfg_data.get("streaming", args.streaming):
+            for dc in dataset_configs:
+                dc.streaming = True
+    else:
+        if not args.n:
+            parser.error("--n is required when using --repos")
+        dataset_configs = build_configs_from_args(args)
+        seed   = args.seed
+        output = args.output
+
+    print(f"\nMixing {len(dataset_configs)} dataset(s) ...")
+    samples = sample_and_mix(
+        dataset_configs,
+        seed=seed,
+        shuffle_output=not args.no_shuffle,
+    )
+    print(f"\nTotal samples: {len(samples)}")
 
     if output:
         with open(output, "w", encoding="utf-8") as f:
-            json.dump(samples, f, indent=2, default=str)
-        print(f"Saved samples to '{output}'.")
-
-    return samples
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Sample n random rows from a HuggingFace dataset.")
-    parser.add_argument("--repo",      required=True,          help="HuggingFace dataset repo ID")
-    parser.add_argument("--n",         required=True, type=int, help="Number of samples to draw")
-    parser.add_argument("--split",     default="train",         help="Dataset split (default: train)")
-    parser.add_argument("--config",    default=None,            help="Dataset config/subset name")
-    parser.add_argument("--seed",      default=None, type=int,  help="Random seed")
-    parser.add_argument("--output",    default=None,            help="Save samples to this JSON file")
-    parser.add_argument("--streaming", action="store_true",     help="Use streaming mode (for huge datasets)")
-    parser.add_argument("--preview",   action="store_true",     help="Print a preview of the first 3 samples")
-    args = parser.parse_args()
-
-    samples = sample_dataset(
-        repo=args.repo,
-        n=args.n,
-        split=args.split,
-        config=args.config,
-        seed=args.seed,
-        output=args.output,
-        streaming=args.streaming,
-    )
+            for record in samples:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"Saved {len(samples)} lines to '{output}'.")
 
     if args.preview:
         print("\n--- Preview (first 3 samples) ---")
-        for i, sample in enumerate(samples[:3]):
-            print(f"\n[{i}] {json.dumps(sample, indent=2, default=str)}")
+        for record in samples[:3]:
+            print(json.dumps(record, ensure_ascii=False))
 
     return samples
 
