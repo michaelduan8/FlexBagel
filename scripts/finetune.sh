@@ -13,7 +13,7 @@ echo Training med_r1 expert
     #     continue
     # fi
 # TODO: setting master port for now since I'm running another deepspeed job
-PYTHONPATH=. MASTER_PORT=29501 deepspeed --num_gpus=$num_gpus train/finetune.py \
+PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=$num_gpus train/finetune.py \
     --run_id "med_r1_qwen2_5-1_5b_expert" \
     --model $model_store/med_r1_qwen25_moe_2x1b_instruct \
     --datasets "$datastore/med_r1/med_r1_traces.jsonl" \
@@ -35,7 +35,7 @@ PYTHONPATH=. MASTER_PORT=29501 deepspeed --num_gpus=$num_gpus train/finetune.py 
     --train_expert_idx 1
 
 echo Training fino1 expert
-PYTHONPATH=. MASTER_PORT=29501 deepspeed --num_gpus=$num_gpus train/finetune.py \
+PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=$num_gpus train/finetune.py \
     --run_id "fino1_qwen2_5-1_5b_expert" \
     --model $model_store/fino1_qwen25_moe_2x1b_instruct \
     --datasets "$datastore/fino1_finqa/fino1_finqa_traces.jsonl" \
