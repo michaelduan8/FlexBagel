@@ -14,7 +14,7 @@ echo Training med_r1 expert
     # fi
 PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/finetune.py \
     --run_id "med_r1_qwen2_5-1_5b_expert" \
-    --model $model_store/med_r1_qwen25_moe_2x1b_instruct/ \
+    --model $model_store/med_r1_qwen25_moe_2x1b_instruct \
     --datasets "$datastore/med_r1/med_r1_traces.jsonl" \
     --num_train_epochs 5 \
     --per_device_train_batch_size 1 \
@@ -36,7 +36,7 @@ PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/finetune.py \
 echo Training fino1 expert
 PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/finetune.py \
     --run_id "fino1_qwen2_5-1_5b_expert" \
-    --model $model_store/fino1_qwen25_moe_2x1b_instruct/ \
+    --model $model_store/fino1_qwen25_moe_2x1b_instruct \
     --datasets "$datastore/fino1_finqa/fino1_finqa_traces.jsonl" \
     --num_train_epochs 5 \
     --per_device_train_batch_size 1 \
