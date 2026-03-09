@@ -1141,9 +1141,9 @@ class FlexQwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
-        # logger.info(f"Loss: {loss.item() if loss is not None else 0}")
-        # logger.info(f"Loss type: {type(loss)}")
-        # logger.info(f"Loss shape: {getattr(loss, 'shape', None)}")
+        logger.info(f"Loss: {loss.item() if loss is not None else 0}")
+        logger.info(f"Loss type: {type(loss)}")
+        logger.info(f"Loss shape: {getattr(loss, 'shape', None)}")
 
         aux_loss = None
         # TODO: may need to remove for expert training
