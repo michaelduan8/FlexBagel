@@ -376,6 +376,7 @@ def main():
             expert_idx=sft_args.train_expert_idx,
             use_lora=sft_args.use_lora,
         )
+        model.enable_input_require_grads() # Need this to still build computational graph?
 
     # ------------------------------------------------------------------
     # LoRA setup
