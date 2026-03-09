@@ -14,6 +14,7 @@ Usage example:
 import re
 import json
 import argparse
+from pathlib import Path
 from datasets import load_dataset
 
 
@@ -60,35 +61,39 @@ def convert_dataset_to_jsonl(
     id_prefix = normalize_dataset_name(dataset_name)
 
     skipped = 0
-    written = 0
+    records = []
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        for index, row in enumerate(ds):
-            row = dict(row)
+    print(f"Processing {len(ds)} rows...")
+    for index, row in enumerate(ds):
+        row = dict(row)
 
-            try:
-                user_content = format_template(user_content_template, row)
-                completion = format_template(assistant_content_template, row)
-            except (KeyError, IndexError, TypeError) as e:
-                print(f"  [row {index}] Skipping — template formatting error: {e}")
-                skipped += 1
-                continue
+        try:
+            user_content = format_template(user_content_template, row)
+            completion = format_template(assistant_content_template, row)
+        except (KeyError, IndexError, TypeError) as e:
+            print(f"  [row {index}] Skipping — template formatting error: {e}")
+            skipped += 1
+            continue
 
-            # Optional pre-filter: skip rows that exceed the character limit
-            if max_chars is not None and (len(user_content) + len(completion)) > max_chars:
-                skipped += 1
-                continue
+        # Optional pre-filter: skip rows that exceed the character limit
+        if max_chars is not None and (len(user_content) + len(completion)) > max_chars:
+            skipped += 1
+            continue
 
-            record = {
-                "prompt_id": f"{id_prefix}_{index}",
-                "prompt": [{"role": "user", "content": user_content}],
-                "completion": completion,
-            }
+        records.append({
+            "prompt_id": f"{id_prefix}_{index}",
+            "prompt": [{"role": "user", "content": user_content}],
+            "completion": completion,
+        })
 
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            written += 1
+    # Ensure output directory exists, then write all records at once
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Done. Written: {written} rows | Skipped: {skipped} rows → {output_path}")
+    with output_file.open("w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n")
+
+    print(f"Done. Written: {len(records)} rows | Skipped: {skipped} rows → {output_path}")
 
 
 def main():
