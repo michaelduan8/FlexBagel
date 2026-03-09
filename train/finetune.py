@@ -57,9 +57,10 @@ from datasets import load_dataset, Dataset
 from datetime import datetime
 from dotenv import load_dotenv
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser, TrainerCallback
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, HfArgumentParser, TrainerCallback
 from trl import SFTTrainer, SFTConfig
 
+from modeling.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM
 
 @dataclass
 class SFTArgs:
@@ -93,6 +94,15 @@ class SFTArgs:
     )
     merge_and_save: bool = field(default=False, metadata={"help": "Merge LoRA weights into base model and save full model"})
 
+
+def register_local_architectures():
+    print("Registering local architectures...")
+    
+    # Register configs to AutoConfig
+    AutoConfig.register("flex_qwen2_moe", Qwen2MoeConfig)
+
+    # Register models to AutoModelForCausalLM
+    AutoModelForCausalLM.register(Qwen2MoeConfig, Qwen2MoeForCausalLM)
 
 def get_dataset_stats(dataset, tokenizer, name):
     """Tokenizes a dataset and returns statistics about token lengths."""
@@ -336,6 +346,8 @@ def main():
     # ------------------------------------------------------------------
     # Model setup
     # ------------------------------------------------------------------
+    register_local_architectures()
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

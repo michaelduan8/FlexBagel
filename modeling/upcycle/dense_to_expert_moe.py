@@ -178,9 +178,9 @@ def main():
     # 2. Load embeddings for gate initialization
     # ------------------------------------------------------------------
     router_weight = load_embeddings(args.embeddings, dense_config.hidden_size)
-    shared_gate_weight = load_shared_gate_embedding(
-        args.shared_gate_embedding, router_weight, dense_config.hidden_size
-    )
+    # shared_gate_weight = load_shared_gate_embedding(
+    #     args.shared_gate_embedding, router_weight, dense_config.hidden_size
+    # )
 
     # ------------------------------------------------------------------
     # 3. Build MoE config + skeleton
