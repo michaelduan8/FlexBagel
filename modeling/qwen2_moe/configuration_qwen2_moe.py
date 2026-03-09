@@ -148,7 +148,7 @@ class Qwen2MoeConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "qwen2_moe"
+    model_type = "flex_qwen2_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen2Moe`
