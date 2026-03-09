@@ -192,6 +192,7 @@ class Qwen2MoeConfig(PretrainedConfig):
         shared_expert_intermediate_size=5632,
         num_experts_per_tok=4,
         num_experts=60,
+        router_temp=4.0,
         norm_topk_prob=False,
         output_router_logits=False,
         router_aux_loss_coef=0.001,

@@ -597,6 +597,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # TODO: bias implementation
         # gate may need to be normalized first
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.router_temp = nn.Parameter(torch.ones(1) * config.router_temp) 
         self.experts = nn.ModuleList(
             [Qwen2MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
@@ -610,7 +611,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+
+        hidden_norm = F.normalize(hidden_states, p=2, dim=-1)
+        gate_norm = F.normalize(self.gate.weight, p=2, dim=-1)
+        router_logits = (hidden_norm @ gate_norm.T) * self.router_temp.exp() # (batch*seq, n_experts)
+        # router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
