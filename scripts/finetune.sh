@@ -12,7 +12,7 @@ echo Training med_r1 expert
     #     echo "Skipping inst-follow qwq v0 Shadow $i (already exists)"
     #     continue
     # fi
-PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/train.py \
+PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/finetune.py \
     --run_id "med_r1_qwen2_5-1_5b_expert" \
     --model $model_store/med_r1_qwen25_moe_2x1b_instruct/ \
     --datasets "$datastore/med_r1/med_r1_traces.jsonl" \
@@ -34,7 +34,7 @@ PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/train.py \
     --train_expert_idx 1
 
 echo Training fino1 expert
-PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/train.py \
+PYTHONPATH=. deepspeed --num_gpus=$num_gpus train/finetune.py \
     --run_id "fino1_qwen2_5-1_5b_expert" \
     --model $model_store/fino1_qwen25_moe_2x1b_instruct/ \
     --datasets "$datastore/fino1_finqa/fino1_finqa_traces.jsonl" \
