@@ -230,6 +230,7 @@ class Qwen2MoeConfig(PretrainedConfig):
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
+        self.router_temp = router_temp
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
