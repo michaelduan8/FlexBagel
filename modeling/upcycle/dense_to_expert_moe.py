@@ -3,7 +3,7 @@ import logging
 import numpy as np
 import torch
 from modeling.qwen2 import Qwen2ForCausalLM, Qwen2Config
-from modeling.qwen2_moe import Qwen2MoeForCausalLM, Qwen2MoeConfig
+from modeling.flex_qwen2_moe import FlexQwen2MoeForCausalLM, FlexQwen2MoeConfig
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -32,9 +32,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_moe_config(dense_config: Qwen2Config, num_experts: int, args) -> Qwen2MoeConfig:
+def build_moe_config(dense_config: Qwen2Config, num_experts: int, args) -> FlexQwen2MoeConfig:
     d = dense_config.to_dict()
-    return Qwen2MoeConfig(
+    return FlexQwen2MoeConfig(
         vocab_size=d["vocab_size"],
         hidden_size=d["hidden_size"],
         intermediate_size=d["intermediate_size"],
@@ -123,7 +123,7 @@ def load_shared_gate_embedding(path: str | None, router_weight: torch.Tensor | N
     return None
 
 
-def is_sparse_layer(layer_idx: int, config: Qwen2MoeConfig) -> bool:
+def is_sparse_layer(layer_idx: int, config: FlexQwen2MoeConfig) -> bool:
     if layer_idx in config.mlp_only_layers:
         return False
     return config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
@@ -189,7 +189,7 @@ def main():
     log.info(f"MoE config:\n{moe_config}")
 
     log.info("Instantiating Qwen2MoE skeleton on CPU ...")
-    moe_model = Qwen2MoeForCausalLM(moe_config)
+    moe_model = FlexQwen2MoeForCausalLM(moe_config)
     moe_sd = moe_model.state_dict()
 
     # ------------------------------------------------------------------

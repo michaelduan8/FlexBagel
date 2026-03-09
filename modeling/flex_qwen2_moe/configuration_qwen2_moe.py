@@ -22,7 +22,7 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class Qwen2MoeConfig(PretrainedConfig):
+class FlexQwen2MoeConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen2MoeModel`]. It is used to instantiate a
     Qwen2MoE model according to the specified arguments, defining the model architecture. Instantiating a configuration

@@ -60,7 +60,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, HfArgumentParser, TrainerCallback
 from trl import SFTTrainer, SFTConfig
 
-from modeling.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM
+from modeling.flex_qwen2_moe import FlexQwen2MoeConfig, FlexQwen2MoeForCausalLM
 
 @dataclass
 class SFTArgs:
@@ -97,12 +97,12 @@ class SFTArgs:
 
 def register_local_architectures():
     print("Registering local architectures...")
-    
+
     # Register configs to AutoConfig
-    AutoConfig.register("flex_qwen2_moe", Qwen2MoeConfig)
+    AutoConfig.register("flex_qwen2_moe", FlexQwen2MoeConfig)
 
     # Register models to AutoModelForCausalLM
-    AutoModelForCausalLM.register(Qwen2MoeConfig, Qwen2MoeForCausalLM)
+    AutoModelForCausalLM.register(FlexQwen2MoeConfig, FlexQwen2MoeForCausalLM)
 
 def get_dataset_stats(dataset, tokenizer, name):
     """Tokenizes a dataset and returns statistics about token lengths."""

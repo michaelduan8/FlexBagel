@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch Qwen2MoE model."""
+# TODO: adapted for flex
 
 import math
 from typing import Optional, Union
@@ -45,7 +46,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
 from transformers.utils.deprecation import deprecate_kwarg
-from .configuration_qwen2_moe import Qwen2MoeConfig
+from .configuration_qwen2_moe import FlexQwen2MoeConfig
 
 
 if is_flash_attn_available():
@@ -170,7 +171,7 @@ class Qwen2MoeRMSNorm(nn.Module):
 class Qwen2MoeRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Qwen2MoeConfig, device=None):
+    def __init__(self, config: FlexQwen2MoeConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
@@ -276,7 +277,7 @@ class Qwen2MoeAttention(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: Qwen2MoeConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: FlexQwen2MoeConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -512,7 +513,7 @@ class Qwen2MoeSdpaAttention(Qwen2MoeAttention):
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
-                "Qwen2MoeModel is using Qwen2MoeSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                "FlexQwen2MoeModel is using Qwen2MoeSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
                 'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
             )
             return super().forward(
@@ -659,7 +660,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
 
 class Qwen2MoeDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen2MoeConfig, layer_idx: int):
+    def __init__(self, config: FlexQwen2MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -756,7 +757,7 @@ class Qwen2MoeDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class Qwen2MoePreTrainedModel(PreTrainedModel):
-    config: Qwen2MoeConfig
+    config: FlexQwen2MoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen2MoeDecoderLayer"]
@@ -779,8 +780,8 @@ class Qwen2MoePreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class Qwen2MoeModel(Qwen2MoePreTrainedModel):
-    def __init__(self, config: Qwen2MoeConfig):
+class FlexQwen2MoeModel(Qwen2MoePreTrainedModel):
+    def __init__(self, config: FlexQwen2MoeConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -988,7 +989,7 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
         dtype: torch.dtype,
         cache_position: torch.Tensor,
         batch_size: int,
-        config: Qwen2MoeConfig,
+        config: FlexQwen2MoeConfig,
         past_key_values: Cache,
     ):
         """
@@ -1008,7 +1009,7 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
                 Indices depicting the position of the input sequence tokens in the sequence.
             batch_size (`torch.Tensor`):
                 Batch size.
-            config (`Qwen2MoeConfig`):
+            config (`FlexQwen2MoeConfig`):
                 The model's configuration class
             past_key_values (`Cache`):
                 The cache class that is being used currently to generate
@@ -1051,14 +1052,14 @@ class Qwen2MoeModel(Qwen2MoePreTrainedModel):
         return causal_mask
 
 
-class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
+class FlexQwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen2MoeModel(config)
+        self.model = FlexQwen2MoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1095,9 +1096,9 @@ class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, Qwen2MoeForCausalLM
+        >>> from transformers import AutoTokenizer, FlexQwen2MoeForCausalLM
 
-        >>> model = Qwen2MoeForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> model = FlexQwen2MoeForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
         >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
@@ -1173,9 +1174,9 @@ class Qwen2MoeForQuestionAnswering(GenericForQuestionAnswering, Qwen2MoePreTrain
 
 
 __all__ = [
-    "Qwen2MoeForCausalLM",
+    "FlexQwen2MoeForCausalLM",
     "Qwen2MoeForQuestionAnswering",
-    "Qwen2MoeModel",
+    "FlexQwen2MoeModel",
     "Qwen2MoePreTrainedModel",
     "Qwen2MoeForSequenceClassification",
     "Qwen2MoeForTokenClassification",
