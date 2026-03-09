@@ -144,9 +144,9 @@ def preprocess_dataset(dataset):
 
     for item in dataset:
         # Expected fields: id, input (list of message dicts), output (string)
-        id = item['id']
-        prompt = item['input']
-        completion = item['output']
+        id = item['prompt_id']
+        prompt = item['prompt']
+        completion = item['completion']
 
         messages_list.append({
             "prompt_id": id,
