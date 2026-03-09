@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from modeling.qwen2 import Qwen2ForCausalLM, Qwen2Config
 from modeling.flex_qwen2_moe import FlexQwen2MoeForCausalLM, FlexQwen2MoeConfig
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ def parse_args():
     parser.add_argument("--num-experts-per-tok", type=int, default=2)
     parser.add_argument("--norm-topk-prob", action="store_true")
     parser.add_argument("--shared-expert-init", choices=["mean", "first"], default="mean")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="Path/HF hub ID to load the tokenizer from. "
+                             "Defaults to the first model in --models.")
     return parser.parse_args()
 
 
@@ -288,7 +292,7 @@ def main():
         log.warning(f"Unhandled key: {key}")
 
     # ------------------------------------------------------------------
-    # 5. Save
+    # 5. Save model
     # ------------------------------------------------------------------
     missing, unexpected = moe_model.load_state_dict(moe_sd, strict=True)
     if missing:
@@ -300,6 +304,16 @@ def main():
     moe_model = moe_model.to(torch.bfloat16)
     moe_model.save_pretrained(args.target, safe_serialization=True)
     moe_config.save_pretrained(args.target)
+
+    # ------------------------------------------------------------------
+    # 6. Save tokenizer
+    # ------------------------------------------------------------------
+    tokenizer_source = args.tokenizer if args.tokenizer is not None else args.models[0]
+    log.info(f"Loading tokenizer from {tokenizer_source} ...")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+    tokenizer.save_pretrained(args.target)
+    log.info(f"Tokenizer saved to {args.target}")
+
     log.info("Done.")
 
 
