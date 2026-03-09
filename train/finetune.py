@@ -1,7 +1,8 @@
 """
 SFT training script for fine-tuning models on synthetic data.
 
-Supports both full fine-tuning and LoRA (Low-Rank Adaptation) training.
+Supports both full fine-tuning and LoRA (Low-Rank Adaptation) training,
+as well as MoE expert-specific training (parameter freezing + router masking).
 
 Expected input format (JSONL):
     {
@@ -29,6 +30,22 @@ Usage (LoRA):
         --lora_r 16 \
         --lora_alpha 32 \
         --num_train_epochs 5
+
+Usage (expert-only fine-tuning):
+    python3 -m train.train \
+        --run_id my_expert_run \
+        --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+        --datasets path/to/data.jsonl \
+        --train_expert_idx 3 \
+        --num_train_epochs 3
+
+Usage (DeepSpeed):
+    deepspeed --num_gpus=4 -m train.train \
+        --run_id my_run \
+        --model meta-llama/Llama-3.2-1B-Instruct \
+        --datasets path/to/data.jsonl \
+        --deepspeed ds_config_zero2.json \
+        --skip_eval
 """
 import numpy as np
 import os
@@ -53,6 +70,12 @@ class SFTArgs:
     run_output_dir: str = field(default="./checkpoints", metadata={"help": "Directory to save training runs"})
     sample_size: int = field(default=None, metadata={"help": "Number of samples to use from the dataset. If None, use all data."})
     eval_n_epochs: float = field(default=2.0, metadata={"help": "Evaluate every N epochs"})
+    save_n_epochs: float = field(default=1.0, metadata={"help": "Save a checkpoint every N epochs"})
+    filter_by_id: list[str] = field(
+        default=None,
+        metadata={"help": "Only keep rows whose prompt_id contains at least one of these substrings. If None, no filtering is applied."}
+    )
+    skip_eval: bool = field(default=False, metadata={"help": "Skip all evaluation. Also skips train/val split — all data is used for training. Useful when using DeepSpeed Stage 1/2."})
     train_expert_idx: int = field(
         default=None,
         metadata={"help": "If set, freeze all weights except this expert's FFN and router row. "
@@ -73,7 +96,7 @@ class SFTArgs:
 
 def get_dataset_stats(dataset, tokenizer, name):
     """Tokenizes a dataset and returns statistics about token lengths."""
-    
+
     def get_token_length(example):
         prompt = example["prompt"]
         completion = example["completion"]
@@ -83,15 +106,13 @@ def get_dataset_stats(dataset, tokenizer, name):
             tokenize=True,
             add_generation_prompt=False
         )
-
-        token_length = len(full_conversation_tokens)
-        return {"token_length": token_length}
+        return {"token_length": len(full_conversation_tokens)}
 
     print(f"Analyzing token lengths for {name} set...")
     processed = dataset.map(get_token_length, num_proc=4)
-    
+
     token_lengths = [count for count in processed["token_length"]]
-    
+
     stats = {
         f"{name.lower()}_avg_tokens": np.mean(token_lengths),
         f"{name.lower()}_max_tokens": np.max(token_lengths),
@@ -99,7 +120,7 @@ def get_dataset_stats(dataset, tokenizer, name):
         f"{name.lower()}_75th_percentile_tokens": np.percentile(token_lengths, 75),
         f"{name.lower()}_90th_percentile_tokens": np.percentile(token_lengths, 90),
     }
-    
+
     print(f"--- {name} Set Token Stats ---")
     for key, value in stats.items():
         print(f"{key}: {value:.2f}")
@@ -112,41 +133,45 @@ def preprocess_dataset(dataset):
     messages_list = []
 
     for item in dataset:
-        id = item['prompt_id']
-        prompt = item['prompt']
-        completions = item['completion']
+        # Expected fields: id, input (list of message dicts), output (string)
+        id = item['id']
+        prompt = item['input']
+        completion = item['output']
 
-        for completion in completions:
-            messages_list.append({
-                "prompt_id": id,
-                "prompt": prompt,
-                "completion": [{"role": "assistant", "content": completion}]
-            })
+        messages_list.append({
+            "prompt_id": id,
+            "prompt": prompt,
+            "completion": [{"role": "assistant", "content": completion}]
+        })
 
-    return Dataset.from_list(messages_list)
+    return messages_list
 
 
-def prepare_datasets(datasets, seed, sample_size=None):
+def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_eval=False):
     loaded_dataset = []
     for dataset_name in datasets:
         print(f"Loading dataset: {dataset_name}")
         
         if "jsonl" in dataset_name:
             dataset = load_dataset('json', data_files=dataset_name, split='train')
+        elif "parquet" in dataset_name:
+            dataset = load_dataset('parquet', data_files=dataset_name, split='train')
         else:
             dataset = load_dataset(dataset_name, split='train')
         
-        for item in dataset:
-            # Expected fields: prompt_id, prompt (list of message dicts), completion (list of strings)
-            id = item['prompt_id']
-            prompt = item['prompt']
-            completion = item['completion']
+        loaded_dataset.extend(preprocess_dataset(dataset))
 
-            loaded_dataset.append({
-                "prompt_id": id,
-                "prompt": prompt,
-                "completion": completion
-            })
+    # Apply id substring filter before any further processing
+    if filter_by_id is not None:
+        pre_filter_size = len(loaded_dataset)
+        loaded_dataset = [
+            item for item in loaded_dataset
+            if any(substr in item["prompt_id"] for substr in filter_by_id)
+        ]
+        print(
+            f"Filtered dataset by id substrings {filter_by_id}: "
+            f"{pre_filter_size} -> {len(loaded_dataset)} rows"
+        )
 
     loaded_dataset = Dataset.from_list(loaded_dataset)
     print(f"Total loaded dataset size: {len(loaded_dataset)}")
@@ -157,46 +182,43 @@ def prepare_datasets(datasets, seed, sample_size=None):
         loaded_dataset = loaded_dataset.shuffle(seed=seed).select(range(sample_size))
         print(f"Sampled dataset size: {len(loaded_dataset)}")
 
-    dataset_split = loaded_dataset.train_test_split(test_size=0.1, seed=seed)
+    # Skip train/val split if evaluation is disabled — use all data for training
+    if skip_eval:
+        print("skip_eval=True: skipping train/val split, using full dataset for training.")
+        return loaded_dataset, None
 
-    train_dataset = preprocess_dataset(dataset_split["train"])
-    test_dataset = preprocess_dataset(dataset_split["test"])
+    dataset_split = loaded_dataset.train_test_split(test_size=0.1, seed=seed)
+    train_dataset = dataset_split["train"]
+    test_dataset = dataset_split["test"]
 
     return train_dataset, test_dataset
 
 
 class WandbLoggingCallback(TrainerCallback):
     """A custom callback to update wandb config and log data examples."""
-    def __init__(self, stats, train_examples, test_examples):
+    def __init__(self, stats, train_examples, test_examples=None):
         self.stats = stats
         self.train_examples = train_examples
         self.test_examples = test_examples
 
     def on_train_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
-            # Update config
             wandb.config.update(self.stats)
-            
-            # Preprocess examples and log them as text
-            processed_train_examples = preprocess_dataset(self.train_examples)
-            processed_test_examples = preprocess_dataset(self.test_examples)
 
             def format_messages(ex):
-                prompt = ex["prompt"]   
-                completion = ex["completion"]
-
                 formatted_str = ""
-                for msg in prompt + completion:
+                for msg in ex["prompt"] + ex["completion"]:
                     formatted_str += f"**{msg['role'].capitalize()}**: {msg['content']}\n\n"
                 return formatted_str
 
-            train_examples_str = "\n\n---\n\n".join([format_messages(ex) for ex in processed_train_examples])
-            test_examples_str = "\n\n---\n\n".join([format_messages(ex) for ex in processed_test_examples])
+            log_data = {
+                "train_examples": "\n\n---\n\n".join([format_messages(ex) for ex in self.train_examples])
+            }
 
-            wandb.log({
-                "train_examples": train_examples_str,
-                "test_examples": test_examples_str
-            })
+            if self.test_examples is not None:
+                log_data["test_examples"] = "\n\n---\n\n".join([format_messages(ex) for ex in self.test_examples])
+
+            wandb.log(log_data)
 
 
 def get_default_lora_target_modules(model_name: str) -> list[str]:
@@ -216,7 +238,6 @@ def get_default_lora_target_modules(model_name: str) -> list[str]:
     elif "qwen" in model_name_lower:
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     else:
-        # Generic fallback
         return ["q_proj", "v_proj"]
 
 
@@ -247,7 +268,7 @@ def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False):
     fine-tuning.
 
     The router gate row for expert_idx is kept trainable. Gradient masking for the
-    router is handled by ExpertFrozenSFTTrainer.training_step, which zeroes out all
+    router is handled by ExpertSFTTrainer.training_step, which zeroes out all
     router gradient rows except expert_idx after each backward pass, before the
     optimizer step. This is cleaner than a backward hook because it avoids polluting
     Adam's momentum/variance buffers for the frozen rows.
@@ -257,20 +278,15 @@ def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False):
         expert_idx: Index of the expert to train.
         use_lora: Whether LoRA will be applied after this call.
     """
-    # Freeze everything first
     for name, param in model.named_parameters():
         if not use_lora and f".mlp.experts.{expert_idx}." in name:
-            # Ensure target expert's weights are unfrozen
             param.requires_grad = True
             print(f"[trainable] {name}")
-
         elif ".mlp.gate.weight" in name:
-            # Ensure router gate is unfrozen
-            # Note this unfreezes the whole gate, we have a wrapper class over the SFTTrainer
-            # to ensure only the router embedding corresponding to the expert is trainable.
+            # Unfreeze the whole gate; ExpertSFTTrainer masks gradients for all
+            # rows except expert_idx after each backward pass.
             param.requires_grad = True
             print(f"[trainable-router] {name}")
-
         else:
             param.requires_grad = False
 
@@ -309,56 +325,28 @@ def main():
     print("Parsed SFTConfig:", sft_config)
     print("SFTArgs:", sft_args)
 
-    run_id = sft_args.run_id
+    load_dotenv()
 
+    run_id = sft_args.run_id
     model_name = sft_args.model
     datasets = sft_args.datasets
-
     run_seed = sft_args.run_seed
-
     run_output_dir = sft_args.run_output_dir
 
-    # Load environment variables from .env file
-    load_dotenv()
-    
+    # ------------------------------------------------------------------
     # Model setup
+    # ------------------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-
-    # Load chat template from local jinja file
-    # with open("path/to/chat_template.jinja", "r") as f:
-    #     tokenizer.chat_template = f.read()
-
-    # TODO: do we need custom template also for tool call?
-    # TODO: switching to completion_only_loss since we want to stick with the base model's template as much as possible
-    # TODO: Need to figure out how to switch to assistant_only in case we multiturn chats
-    # # Chat template with generation tags for assistant_only_loss
-    # tokenizer.chat_template = (
-    #     "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}"
-    #     "{% for message in messages %}"
-    #         "{% if message['role'] == 'user' %}"
-    #             "{{ bos_token }}### Question:\n{{ message['content'] }}"
-    #         "{% elif message['role'] == 'assistant' %}"
-    #             "\n\n### Answer:\n"
-    #             "{% generation %}"
-    #             "{{ message['content'] }}{{ eos_token }}"
-    #             "{% endgeneration %}"
-    #         "{% endif %}"
-    #     "{% endfor %}"
-    #     "{% if add_generation_prompt %}"
-    #         "\n\n### Answer:\n"
-    #     "{% endif %}"
-    # )
-    
     use_bf16 = torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
         attn_implementation="flash_attention_2",
-        device_map="auto",
+        device_map="auto" if not sft_config.deepspeed else None,  # device_map conflicts with DeepSpeed
     )
 
     # ------------------------------------------------------------------
@@ -387,7 +375,8 @@ def main():
             print(f"LoRA scoped to expert {sft_args.train_expert_idx}: target_modules={target_modules}")
         else:
             target_modules = sft_args.lora_target_modules or get_default_lora_target_modules(model_name)
-            print(f"Applying LoRA with target modules: {target_modules}")
+            print(f"Applying LoRA with r={sft_args.lora_r}, alpha={sft_args.lora_alpha}")
+            print(f"LoRA target modules: {target_modules}")
 
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -414,21 +403,33 @@ def main():
         # Full fine-tune of expert only — just print the parameter count
         print_trainable_parameters(model)
 
-    # model.gradient_checkpointing_enable()
-    # model.resize_token_embeddings(len(tokenizer))
-
-    # Load and preprocess datasets
-    sample_size = sft_args.sample_size
-    train_dataset, test_dataset = prepare_datasets(datasets, seed=run_seed, sample_size=sample_size)
+    # ------------------------------------------------------------------
+    # Dataset preparation
+    # ------------------------------------------------------------------
+    train_dataset, test_dataset = prepare_datasets(
+        datasets,
+        seed=run_seed,
+        sample_size=sft_args.sample_size,
+        filter_by_id=sft_args.filter_by_id,
+        skip_eval=sft_args.skip_eval,
+    )
 
     train_stats, _ = get_dataset_stats(train_dataset, tokenizer, "Train")
-    test_stats, _ = get_dataset_stats(test_dataset, tokenizer, "Test")
+    test_stats = {}
+    if test_dataset is not None:
+        test_stats, _ = get_dataset_stats(test_dataset, tokenizer, "Test")
 
     # Sample some examples to log to wandb
     NUM_EXAMPLES_TO_LOG = 5
     train_examples_to_log = train_dataset.shuffle(seed=run_seed).select(range(NUM_EXAMPLES_TO_LOG))
-    test_examples_to_log = test_dataset.shuffle(seed=run_seed).select(range(NUM_EXAMPLES_TO_LOG))
-    
+    test_examples_to_log = (
+        test_dataset.shuffle(seed=run_seed).select(range(NUM_EXAMPLES_TO_LOG))
+        if test_dataset is not None else None
+    )
+
+    # ------------------------------------------------------------------
+    # SFTConfig
+    # ------------------------------------------------------------------
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     lora_suffix = "_lora" if sft_args.use_lora else ""
     expert_suffix = f"_expert{sft_args.train_expert_idx}" if sft_args.train_expert_idx is not None else ""
@@ -437,59 +438,68 @@ def main():
         f"{run_id}{lora_suffix}{expert_suffix}_{model_name.replace('/', '_')}_{timestamp}"
     )
     run_name = f"{run_id}{lora_suffix}{expert_suffix}_{timestamp}"
-    
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
     per_device_train_batch_size = sft_config.per_device_train_batch_size
     gradient_accumulation_steps = sft_config.gradient_accumulation_steps
-    eval_steps = int((len(train_dataset) / (per_device_train_batch_size * gradient_accumulation_steps * num_gpus)) * sft_args.eval_n_epochs)
-    eval_steps = max(1, eval_steps)  # Ensure at least 1 step for small datasets
-    print(f"Eval steps: {eval_steps}")
+    steps_per_epoch = len(train_dataset) / (per_device_train_batch_size * gradient_accumulation_steps * num_gpus)
 
-    # Update remaining parameter for SFT Config
+    save_steps = max(1, int(steps_per_epoch * sft_args.save_n_epochs))
+    print(f"Save steps: {save_steps} (every {sft_args.save_n_epochs} epochs)")
+
     sft_config.output_dir = run_output_dir
     sft_config.save_strategy = "steps"
-    sft_config.eval_strategy = "steps"
-    sft_config.eval_steps = eval_steps
-    sft_config.save_steps = eval_steps
-    sft_config.do_eval = True
+    sft_config.save_steps = save_steps
     sft_config.bf16 = use_bf16
     sft_config.fp16 = not use_bf16
     sft_config.report_to = "wandb"
     sft_config.run_name = run_name
-
-    # Consider using assistant_only_loss for muliturn
     sft_config.completion_only_loss = True
     sft_config.seed = run_seed
     sft_config.data_seed = run_seed
 
+    if sft_args.skip_eval:
+        sft_config.eval_strategy = "no"
+        sft_config.do_eval = False
+        print("skip_eval=True: evaluation disabled.")
+    else:
+        eval_steps = max(1, int(steps_per_epoch * sft_args.eval_n_epochs))
+        print(f"Eval steps: {eval_steps} (every {sft_args.eval_n_epochs} epochs)")
+        sft_config.eval_strategy = "steps"
+        sft_config.eval_steps = eval_steps
+        sft_config.do_eval = True
+
     print("Final SFTConfig:", sft_config)
 
     wandb_stats = {
-        "sample_size": sample_size,
+        "sample_size": sft_args.sample_size,
+        "filter_by_id": sft_args.filter_by_id,
         "train_dataset_size": len(train_dataset),
-        "test_dataset_size": len(test_dataset),
+        "test_dataset_size": len(test_dataset) if test_dataset is not None else 0,
         **train_stats,
         **test_stats,
         "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-        "initial_gpu_memory_gb": torch.cuda.memory_allocated()/1024**3 if torch.cuda.is_available() else 0,
+        "initial_gpu_memory_gb": torch.cuda.memory_allocated() / 1024 ** 3 if torch.cuda.is_available() else 0,
         "use_lora": sft_args.use_lora,
         **lora_stats,
     }
-    
-    # --- Trainer --- 
+
+    # ------------------------------------------------------------------
+    # Trainer
+    # ------------------------------------------------------------------
     trainer = ExpertSFTTrainer(
         model=model,
         processing_class=tokenizer,
         args=sft_config,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        eval_dataset=test_dataset,  # None when skip_eval=True
         callbacks=[WandbLoggingCallback(wandb_stats, train_examples_to_log, test_examples_to_log)],
         expert_idx=sft_args.train_expert_idx,
     )
-    
-    trainer.evaluate() # Evaluate once before training
-    
+
+    if not sft_args.skip_eval:
+        trainer.evaluate()  # Evaluate once before training
+
     print("Starting training...")
     trainer.train()
     final_output_dir = os.path.join(run_output_dir, "final")
@@ -506,7 +516,9 @@ def main():
         if sft_args.use_lora:
             print(f"LoRA adapter saved to {final_output_dir}")
 
-    trainer.evaluate()  # Final evaluation after training
+    if not sft_args.skip_eval:
+        trainer.evaluate()  # Final evaluation after training
+
 
 if __name__ == "__main__":
     main()

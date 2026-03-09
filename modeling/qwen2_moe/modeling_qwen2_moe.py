@@ -594,6 +594,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
 
         # gating
+        # TODO: bias implementation
+        # gate may need to be normalized first
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [Qwen2MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
@@ -1134,6 +1136,7 @@ class Qwen2MoeForCausalLM(Qwen2MoePreTrainedModel, GenerationMixin):
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         aux_loss = None
+        # TODO: may need to remove for expert training
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
