@@ -328,8 +328,6 @@ class ExpertSFTTrainer(SFTTrainer):
                         mask[self.expert_idx] = 1.0
                         param.grad *= mask
 
-        print(type(loss), getattr(loss, "shape", None))
-
         return loss
 
 
