@@ -243,4 +243,4 @@ class FlexQwen2MoeConfig(PretrainedConfig):
         )
 
 
-__all__ = ["Qwen2MoeConfig"]
+__all__ = ["FlexQwen2MoeConfig"]
