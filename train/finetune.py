@@ -297,9 +297,6 @@ def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False):
             # rows except expert_idx after each backward pass.
             param.requires_grad = True
             print(f"[trainable-router] {name}")
-        elif ".mlp.router_temp.weight" in name:
-            param.requires_grad = True
-            print(f"[trainable-router-temp] {name}")
         else:
             param.requires_grad = False
 

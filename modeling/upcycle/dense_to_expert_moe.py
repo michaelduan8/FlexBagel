@@ -28,7 +28,11 @@ def parse_args():
     parser.add_argument("--decoder-sparse-step", type=int, default=1)
     parser.add_argument("--mlp-only-layers", nargs="*", type=int, default=[])
     parser.add_argument("--num-experts-per-tok", type=int, default=2)
+    parser.add_argument("--normalize-router-gate-and-hidden", action="store_true",
+                        help="L2-normalize hidden states and router gate rows before routing logits.")
     parser.add_argument("--norm-topk-prob", action="store_true")
+    parser.add_argument("--output-router-logits", action="store_true",
+                        help="Enable returning router logits during forward pass.")
     parser.add_argument("--shared-expert-init", choices=["mean", "first"], default="mean")
     parser.add_argument("--tokenizer", type=str, default=None,
                         help="Path/HF hub ID to load the tokenizer from. "
@@ -62,8 +66,9 @@ def build_moe_config(dense_config: Qwen2Config, num_experts: int, args) -> FlexQ
         shared_expert_intermediate_size=d["intermediate_size"],
         decoder_sparse_step=args.decoder_sparse_step,
         mlp_only_layers=args.mlp_only_layers,
+        normalize_router_gate_and_hidden=args.normalize_router_gate_and_hidden,
         norm_topk_prob=args.norm_topk_prob,
-        output_router_logits=False,
+        output_router_logits=args.output_router_logits,
         router_aux_loss_coef=0.001,
     )
 

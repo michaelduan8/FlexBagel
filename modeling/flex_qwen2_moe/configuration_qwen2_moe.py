@@ -122,6 +122,8 @@ class FlexQwen2MoeConfig(PretrainedConfig):
             Number of selected experts.
         num_experts (`int`, *optional*, defaults to 60):
             Number of routed experts.
+        normalize_router_gate_and_hidden (`bool`, *optional*, defaults to `False`):
+            Whether to L2-normalize hidden states and router gate rows before computing router logits.
         norm_topk_prob (`bool`, *optional*, defaults to `False`):
             Whether to normalize the topk probabilities.
         output_router_logits (`bool`, *optional*, defaults to `False`):
@@ -192,7 +194,7 @@ class FlexQwen2MoeConfig(PretrainedConfig):
         shared_expert_intermediate_size=5632,
         num_experts_per_tok=4,
         num_experts=60,
-        router_temp=4.0,
+        normalize_router_gate_and_hidden=False,
         norm_topk_prob=False,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
@@ -230,7 +232,7 @@ class FlexQwen2MoeConfig(PretrainedConfig):
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
-        self.router_temp = router_temp
+        self.normalize_router_gate_and_hidden = normalize_router_gate_and_hidden
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
