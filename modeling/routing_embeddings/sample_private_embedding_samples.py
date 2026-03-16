@@ -1,6 +1,7 @@
 """
 Sample n random examples from one or more HuggingFace dataset repos and mix them together.
 Optionally format each sampled row into a "doc" column using a per-dataset template.
+You can also format from a prebuilt chat message column via a tokenizer chat template.
 
 Usage (single dataset):
     python sample_hf_dataset.py \
@@ -28,14 +29,18 @@ Usage (via JSON config file):
       "n": 50,
       "split": "test",
       "config": null,
-      "doc_template": "{text} [label={label}]"
+            "doc_template": "{text} [label={label}]",
+            "chat_messages_column": null,
+            "chat_template_tokenizer": null
     },
     {
       "repo": "rajpurkar/squad",
       "n": 50,
       "split": "validation",
       "config": null,
-      "doc_template": "Q: {question}\nContext: {context}\nA: {answers[text][0]}"
+            "doc_template": "Q: {question}\nContext: {context}\nA: {answers[text][0]}",
+            "chat_messages_column": null,
+            "chat_template_tokenizer": null
     }
   ]
 }
@@ -48,6 +53,7 @@ import random
 import re
 from dataclasses import dataclass
 from datasets import load_dataset
+from transformers import AutoTokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,8 @@ class DatasetConfig:
     split: str = "train"
     config: str | None = None
     doc_template: str | None = None
+    chat_messages_column: str | None = None
+    chat_template_tokenizer: str | None = None
     streaming: bool = False
 
     @staticmethod
@@ -115,15 +123,49 @@ class DatasetConfig:
             split=d.get("split", "train"),
             config=d.get("config", None),
             doc_template=d.get("doc_template", None),
+            chat_messages_column=d.get("chat_messages_column", None),
+            chat_template_tokenizer=d.get("chat_template_tokenizer", None),
             streaming=d.get("streaming", False),
         )
+
+
+def _render_chat_template(
+    row: dict,
+    chat_messages_column: str,
+    tokenizer_name: str,
+    tokenizer_cache: dict[str, AutoTokenizer],
+) -> str:
+    """Render chat messages through tokenizer.apply_chat_template(tokenize=False)."""
+    if tokenizer_name not in tokenizer_cache:
+        tokenizer_cache[tokenizer_name] = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    try:
+        messages = _resolve_path(row, chat_messages_column)
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(
+            f"Chat messages field '{chat_messages_column}' not found in row. "
+            f"Available keys: {list(row.keys())}"
+        ) from e
+
+    if not isinstance(messages, list):
+        raise ValueError(
+            f"Chat messages field '{chat_messages_column}' must be a list, "
+            f"got {type(messages)}"
+        )
+
+    tokenizer = tokenizer_cache[tokenizer_name]
+    return tokenizer.apply_chat_template(messages, tokenize=False)
 
 
 # ---------------------------------------------------------------------------
 # Core sampling logic
 # ---------------------------------------------------------------------------
 
-def sample_one(cfg: DatasetConfig, seed: int | None) -> list[dict]:
+def sample_one(
+    cfg: DatasetConfig,
+    seed: int | None,
+    tokenizer_cache: dict[str, AutoTokenizer],
+) -> list[dict]:
     """Load a single dataset and return cfg.n random samples as plain dicts."""
     label = f"'{cfg.repo}'" + (f" ({cfg.config})" if cfg.config else "")
     print(f"  Loading {label} split='{cfg.split}' n={cfg.n} ...")
@@ -147,7 +189,22 @@ def sample_one(cfg: DatasetConfig, seed: int | None) -> list[dict]:
     dataset_slug = re.sub(r'[^a-z0-9]+', '_', cfg.repo.lower()).strip('_')
     records = []
     for idx, row in enumerate(samples):
-        doc = render_template(cfg.doc_template, row) if cfg.doc_template is not None else ""
+        if cfg.chat_messages_column is not None:
+            if cfg.chat_template_tokenizer is None:
+                raise ValueError(
+                    f"Dataset '{cfg.repo}' set chat_messages_column but no "
+                    "chat_template_tokenizer was provided."
+                )
+            doc = _render_chat_template(
+                row,
+                cfg.chat_messages_column,
+                cfg.chat_template_tokenizer,
+                tokenizer_cache,
+            )
+        elif cfg.doc_template is not None:
+            doc = render_template(cfg.doc_template, row)
+        else:
+            doc = ""
         records.append({
             "id": f"{dataset_slug}_{idx}",
             "doc": doc,
@@ -164,8 +221,9 @@ def sample_and_mix(
 ) -> list[dict]:
     """Sample from each dataset config and mix (concatenate + optionally shuffle) results."""
     all_samples: list[dict] = []
+    tokenizer_cache: dict[str, AutoTokenizer] = {}
     for cfg in dataset_configs:
-        all_samples.extend(sample_one(cfg, seed=seed))
+        all_samples.extend(sample_one(cfg, seed=seed, tokenizer_cache=tokenizer_cache))
 
     if shuffle_output and len(dataset_configs) > 1:
         rng = random.Random(seed)
@@ -184,28 +242,60 @@ def build_configs_from_args(args) -> list[DatasetConfig]:
     splits = args.splits or ["train"] * len(repos)
     configs = args.configs or [None] * len(repos)
     templates = args.doc_templates or [None] * len(repos)
+    message_columns = args.chat_messages_columns or [None] * len(repos)
+    chat_template_tokenizers = args.chat_template_tokenizers or [None] * len(repos)
 
     # Broadcast single value to all datasets
     if len(ns) == 1:        ns = ns * len(repos)
     if len(splits) == 1:    splits = splits * len(repos)
     if len(configs) == 1:   configs = configs * len(repos)
     if len(templates) == 1: templates = templates * len(repos)
+    if len(message_columns) == 1: message_columns = message_columns * len(repos)
+    if len(chat_template_tokenizers) == 1:
+        chat_template_tokenizers = chat_template_tokenizers * len(repos)
 
     lengths = {
         "repos": len(repos), "n": len(ns), "splits": len(splits),
         "configs": len(configs), "doc_templates": len(templates),
+        "chat_messages_columns": len(message_columns),
+        "chat_template_tokenizers": len(chat_template_tokenizers),
     }
     if len(set(lengths.values())) != 1:
         raise ValueError(
             f"All list arguments must have the same length (or length 1). Got: {lengths}"
         )
 
+    for i, (repo, msg_col, chat_tok) in enumerate(
+        zip(repos, message_columns, chat_template_tokenizers)
+    ):
+        if msg_col is not None and chat_tok is None:
+            raise ValueError(
+                f"Dataset index {i} ('{repo}') set --chat-messages-columns but "
+                "is missing --chat-template-tokenizers."
+            )
+        if msg_col is None and chat_tok is not None:
+            raise ValueError(
+                f"Dataset index {i} ('{repo}') set --chat-template-tokenizers but "
+                "is missing --chat-messages-columns."
+            )
+
     return [
         DatasetConfig(
             repo=repo, n=n, split=split, config=cfg,
-            doc_template=tmpl, streaming=args.streaming,
+            doc_template=tmpl,
+            chat_messages_column=msg_col,
+            chat_template_tokenizer=chat_tok,
+            streaming=args.streaming,
         )
-        for repo, n, split, cfg, tmpl in zip(repos, ns, splits, configs, templates)
+        for repo, n, split, cfg, tmpl, msg_col, chat_tok in zip(
+            repos,
+            ns,
+            splits,
+            configs,
+            templates,
+            message_columns,
+            chat_template_tokenizers,
+        )
     ]
 
 
@@ -236,6 +326,16 @@ def main():
                         help="HF config/subset name per dataset")
     parser.add_argument("--doc-templates", nargs="+", metavar="TMPL",
                         help='Format template per dataset, e.g. "{title}: {body}"')
+    parser.add_argument("--chat-messages-columns", nargs="+", metavar="COL",
+                        help=(
+                            "Column/path per dataset containing chat messages list (e.g. messages). "
+                            "If set, uses tokenizer chat templating instead of --doc-templates."
+                        ))
+    parser.add_argument("--chat-template-tokenizers", nargs="+", metavar="TOKENIZER",
+                        help=(
+                            "Tokenizer name/path per dataset used for apply_chat_template, "
+                            "e.g. Qwen/Qwen2.5-1.5B-Instruct"
+                        ))
 
     # --- global options ---
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -252,7 +352,7 @@ def main():
 
     # --- build dataset configs ---
     if args.config_file:
-        with open(args.config_file) as f:
+        with open(args.config_file, encoding="utf-8") as f:
             cfg_data = json.load(f)
         dataset_configs = [DatasetConfig.from_dict(d) for d in cfg_data["datasets"]]
         seed   = cfg_data.get("seed", args.seed)
