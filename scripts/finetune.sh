@@ -3,7 +3,7 @@ OUTPUT_DIR="/scratch1/duanm/flex_experts/"
 
 model_store=experts
 datastore=traces/text_only_warmup/
-ds_config=train/ds_config/v0.json
+ds_config=train/ds_config/stage3.json #train/ds_config/v0.json
 run_seed=2026
 num_gpus=4
 
