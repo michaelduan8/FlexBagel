@@ -138,11 +138,13 @@ def load_balancing_loss_func(
             router_per_expert_attention_mask, dim=0
         )
 
-    device_index = routing_weights.device.index if routing_weights.device.index is not None else 0
-    rank = routing_weights.shape[1] * int(device_index)
-    overall_loss = torch.sum(
-        tokens_per_expert[:, rank : rank + routing_weights.shape[1]] * router_prob_per_expert.unsqueeze(0)
-    )
+    # device_index = routing_weights.device.index if routing_weights.device.index is not None else 0
+    # rank = routing_weights.shape[1] * int(device_index)
+    # overall_loss = torch.sum(
+    #     tokens_per_expert[:, rank : rank + routing_weights.shape[1]] * router_prob_per_expert.unsqueeze(0)
+    # )
+    # TODO; updated loss computation to wokr with DDP/DeepSpeed, the above is needed for expert parallelism (or a better version)
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
 
 
