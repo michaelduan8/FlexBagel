@@ -117,26 +117,40 @@ def register_local_architectures():
 IMAGE_DIR = "/scratch1/duanm/data/pubmed_vision/"
 def preprocess_dataset(dataset):
     """Convert dataset to conversational prompt-completion format for SFTTrainer."""
+    def load_images(item):
+        assert "image" in item, "Item must contain 'image' key"
+
+        images = item["image"]
+        loaded_images = []
+        for img_path in images:
+            try:
+                img_path = os.path.join(IMAGE_DIR, img_path)
+                with open(img_path, "rb") as f:
+                    img_bytes = f.read()
+                loaded_images.append(img_bytes)
+            except Exception as e:
+                print(f"Error loading image {img_path}: {e}")
+                continue
+
+        item["loaded_images"] = loaded_images
+        return item
 
     def convert_row(item):
-        assert "image" in item and "conversations" in item and "id" in item
+        assert "loaded_images" in item and "conversations" in item and "id" in item
         # TODO: confirm standardized format later
         id = item["id"]
-        images = item["image"]
+        images = item["loaded_images"]
         conversations = item["conversations"]
 
         # Load the images as needed
-        loaded_images = []
+        converted_images = []
         if len(images) > 0:
-            for img_path in images:
+            for img_bytes in images:
                 try:
-                    img_path = os.path.join(IMAGE_DIR, img_path)
-                    with open(img_path, "rb") as f:
-                        img_bytes = f.read()
-                    image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    loaded_images.append({"type": "image", "image": image})
+                    image = Image.open(io.BytesIO(img_bytes)).convert("RGB") #Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    converted_images.append({"type": "image", "image": image})
                 except Exception as e:
-                    print(f"Error loading image {img_path}: {e}")
+                    print(f"Error loading image: {e}")
                     continue
 
         # TODO: need to standardize to role/content format
@@ -148,7 +162,7 @@ def preprocess_dataset(dataset):
             assert turn["from"] != "gpt"
             if turn["from"] == "human":
                 role = "user"
-                content = loaded_images + [{"type": "text", "text": turn["value"]}]
+                content = converted_images + [{"type": "text", "text": turn["value"]}]
             else:
                 role = turn["from"]
                 content = [{"type": "text", "text": turn["value"]}]
@@ -161,18 +175,10 @@ def preprocess_dataset(dataset):
             "completion": [{"role": "assistant", "content": [{"type": "text", "text": conversations[-1]["value"]}]}],
         }
 
-    def convert_batch(batch):
-        results = {"prompt_id": [], "prompt": [], "completion": []}
-        for i in range(len(batch["id"])):
-            row = {k: batch[k][i] for k in batch}
-            converted = convert_row(row)  # your existing per-row logic
-            if converted:
-                for k in results:
-                    results[k].append(converted[k])
-        return results
-
     # batched=True, batch_size=2,
-    return dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=4)
+    dataset = dataset.map(load_images, remove_columns="image", num_proc=6)
+    print(dataset)
+    return dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=6)
 
 
 def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_eval=False, dataset_args=None):
