@@ -17,8 +17,11 @@ import json
 import string
 import argparse
 import ast
+import random
 from pathlib import Path
 from datasets import load_dataset
+
+from tqdm import tqdm
 
 
 def normalize_dataset_name(name: str) -> str:
@@ -37,6 +40,39 @@ def format_template(template: str, row: dict) -> str:
       - {messages[1]["content"]}
     """
     return DeepTemplateFormatter().format(template, **row)
+
+
+def row_matches_filters(row: dict, column_filters: dict[str, object]) -> bool:
+    """
+    Check whether a row satisfies all column filters.
+
+    Filter keys can use the same nested accessor syntax as templates, e.g.:
+      - prompt_language
+      - metadata.lang
+      - messages[2]["role"]
+
+    Filter values:
+      - scalar: require exact equality
+      - list: row value must be one of the listed values
+    """
+    if not column_filters:
+        return True
+
+    formatter = DeepTemplateFormatter()
+    for field_path, expected in column_filters.items():
+        try:
+            actual = formatter._resolve_field_path(field_path, row)
+        except (KeyError, IndexError, TypeError):
+            return False
+
+        if isinstance(expected, list):
+            if actual not in expected:
+                return False
+        else:
+            if actual != expected:
+                return False
+
+    return True
 
 
 class DeepTemplateFormatter(string.Formatter):
@@ -133,6 +169,8 @@ def convert_dataset_to_jsonl(
     subset: str | None = None,
     num_samples: int | None = None,
     max_chars: int | None = None,
+    column_filters: dict[str, object] | None = None,
+    seed: int | None = None,
 ):
     """
     Load a HuggingFace dataset and write it as a JSONL file.
@@ -144,12 +182,17 @@ def convert_dataset_to_jsonl(
         assistant_content_template: Python format string using dataset column names for the assistant turn.
         split:                      Dataset split to use (default: "train").
         subset:                     Optional dataset subset/config name.
-        num_samples:                Optional max number of output samples to write.
+        num_samples:                Optional number of output samples to write after processing
+                                    the full dataset and randomly sampling valid rows.
         max_chars:                  Optional max combined character length of prompt content +
                                     completion. Rows exceeding this are skipped.
+        column_filters:             Optional dict of field path -> expected value filters.
+                                    All filters must match for a row to be included.
+        seed:                       Optional random seed used when --num_samples performs
+                                    random downsampling.
     """
     print(f"Loading dataset '{dataset_name}' (split='{split}', subset={subset!r})...")
-    ds = load_dataset(dataset_name, subset, split=split)
+    ds = load_dataset(dataset_name, subset, split=split, num_proc=6)
 
     id_prefix = normalize_dataset_name(dataset_name)
 
@@ -157,11 +200,18 @@ def convert_dataset_to_jsonl(
     records = []
 
     print(f"Processing {len(ds)} rows...")
-    for index, row in enumerate(ds):
+    for index, row in tqdm(enumerate(ds)):
         row = dict(row)
-        assert len(row["messages"]) == 3
-        assert row["messages"][0]["role"] == "system" and row["messages"][0]["content"] == "" and row["messages"][1]["role"] == "user" and row["messages"][2]["role"] == "assistant"
-        assert "content" in row["messages"][2] and "reasoning_content" in row["messages"][2]
+        if index % 10000 == 0:
+            print(row)
+        # assert len(row["messages"]) == 3
+        # assert row["messages"][0]["role"] == "system" and row["messages"][0]["content"] == "" and row["messages"][1]["role"] == "user" and row["messages"][2]["role"] == "assistant"
+        # assert "content" in row["messages"][2] and "reasoning_content" in row["messages"][2]
+
+        # Optional row filter
+        if column_filters and not row_matches_filters(row, column_filters):
+            skipped += 1
+            continue
 
         try:
             user_content = format_template(user_content_template, row)
@@ -182,9 +232,9 @@ def convert_dataset_to_jsonl(
             "completion": completion,
         })
 
-        # Stop once we have collected the requested number of valid samples.
-        if num_samples is not None and len(records) >= num_samples:
-            break
+    if num_samples is not None and len(records) > num_samples:
+        rng = random.Random(seed)
+        records = rng.sample(records, num_samples)
 
     # Ensure output directory exists, then write all records at once
     output_file = Path(output_path)
@@ -243,8 +293,8 @@ def main():
         type=int,
         default=None,
         help=(
-            "Optional max number of output samples to write. "
-            "Stops after collecting this many valid rows."
+            "Optional number of output samples to write. "
+            "Processes the full dataset first, then randomly samples this many valid rows."
         ),
     )
     parser.add_argument(
@@ -256,11 +306,41 @@ def main():
             "Rows exceeding this are excluded from the output."
         ),
     )
+    parser.add_argument(
+        "--column_filters",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON object mapping field paths to required values. "
+            "Rows must match all filters to be included. "
+            "Example: '{\"prompt_language\":\"en\",\"answer_language\":\"en\"}'. "
+            "You can also use nested paths like '{\"messages[2]['role']\":\"assistant\"}'. "
+            "If a value is a list, any listed value is accepted."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed for deterministic row sampling when --num_samples is set.",
+    )
 
     args = parser.parse_args()
 
     if args.num_samples is not None and args.num_samples <= 0:
         parser.error("--num_samples must be a positive integer")
+
+    column_filters = None
+    if args.column_filters is not None:
+        try:
+            parsed_filters = json.loads(args.column_filters)
+        except json.JSONDecodeError as e:
+            parser.error(f"--column_filters must be valid JSON: {e}")
+        if not isinstance(parsed_filters, dict):
+            parser.error("--column_filters must be a JSON object (dictionary)")
+        if any(not isinstance(k, str) for k in parsed_filters.keys()):
+            parser.error("--column_filters keys must be strings")
+        column_filters = parsed_filters
 
     convert_dataset_to_jsonl(
         dataset_name=args.dataset,
@@ -271,6 +351,8 @@ def main():
         subset=args.subset,
         num_samples=args.num_samples,
         max_chars=args.max_chars,
+        column_filters=column_filters,
+        seed=args.seed,
     )
 
 

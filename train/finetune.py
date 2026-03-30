@@ -49,6 +49,8 @@ Usage (DeepSpeed):
 """
 import numpy as np
 import os
+import random
+import sys
 import torch
 import wandb
 
@@ -69,7 +71,12 @@ class SFTArgs:
     datasets: list[str] = field(metadata={"help": "Dataset(s) to use for training"})
     run_seed: int = field(default=2025, metadata={"help": "Random seed for training"})
     run_output_dir: str = field(default="./checkpoints", metadata={"help": "Directory to save training runs"})
-    sample_size: int = field(default=None, metadata={"help": "Number of samples to use from the dataset. If None, use all data."})
+    sample_size: list[int] = field(
+        default=None,
+        metadata={"help": "Sampling control. Pass one value for global sampling after datasets are merged "
+                          "(same behavior as before), or pass one value per dataset to sample each dataset "
+                          "individually before merging."}
+    )
     eval_n_epochs: float = field(default=2.0, metadata={"help": "Evaluate every N epochs"})
     save_n_epochs: float = field(default=1.0, metadata={"help": "Save a checkpoint every N epochs"})
     filter_by_id: list[str] = field(
@@ -81,6 +88,19 @@ class SFTArgs:
         default=None,
         metadata={"help": "If set, freeze all weights except this expert's FFN and router row. "
                           "If use_lora is also set, LoRA is applied only to this expert's modules."}
+    )
+    router_tuning_only: bool = field(
+        default=False,
+        metadata={"help": "If set, freeze all weights except MoE router gate weights across all experts. "
+                          "When enabled, train_expert_idx is ignored and forced to None."}
+    )
+    unfreeze_attn: bool = field(
+        default=False,
+        metadata={"help": "If set, unfreeze attention layers after expert/router freezing and before LoRA setup."}
+    )
+    unfreeze_embed: bool = field(
+        default=False,
+        metadata={"help": "If set, unfreeze embedding layer parameters after expert/router freezing and before LoRA setup."}
     )
 
     # LoRA parameters
@@ -158,8 +178,24 @@ def preprocess_dataset(dataset):
 
 
 def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_eval=False):
+    if sample_size is not None:
+        if isinstance(sample_size, int):
+            sample_sizes = [sample_size]
+        else:
+            sample_sizes = list(sample_size)
+
+        if len(sample_sizes) not in (1, len(datasets)):
+            raise ValueError(
+                f"sample_size must be either a single value or a list with one value per dataset "
+                f"(got {len(sample_sizes)} values for {len(datasets)} datasets)."
+            )
+        if any(size is not None and size < 0 for size in sample_sizes):
+            raise ValueError("sample_size values must be non-negative.")
+    else:
+        sample_sizes = None
+
     loaded_dataset = []
-    for dataset_name in datasets:
+    for idx, dataset_name in enumerate(datasets):
         print(f"Loading dataset: {dataset_name}")
         
         if "jsonl" in dataset_name:
@@ -169,7 +205,18 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
         else:
             dataset = load_dataset(dataset_name, split='train')
         
-        loaded_dataset.extend(preprocess_dataset(dataset))
+        processed_dataset = preprocess_dataset(dataset)
+
+        # Per-dataset sampling: one sample size per dataset path.
+        if sample_sizes is not None and len(sample_sizes) == len(datasets):
+            dataset_sample_size = sample_sizes[idx]
+            if dataset_sample_size is not None and dataset_sample_size < len(processed_dataset):
+                print(f"Sampling {dataset_sample_size} examples from dataset[{idx}]...")
+                processed_dataset = np.random.default_rng(seed).choice(processed_dataset, size=dataset_sample_size, replace=False).tolist()
+            
+            print(f"Sampled dataset[{idx}] size: {len(processed_dataset)}")
+
+        loaded_dataset.extend(processed_dataset)
 
     # Apply id substring filter before any further processing
     if filter_by_id is not None:
@@ -186,11 +233,13 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
     loaded_dataset = Dataset.from_list(loaded_dataset)
     print(f"Total loaded dataset size: {len(loaded_dataset)}")
 
-    # Sample a subset if sample_size is specified
-    if sample_size is not None and sample_size < len(loaded_dataset):
-        print(f"Sampling {sample_size} examples from dataset...")
-        loaded_dataset = loaded_dataset.shuffle(seed=seed).select(range(sample_size))
-        print(f"Sampled dataset size: {len(loaded_dataset)}")
+    # Global sampling behavior (legacy): apply one sample size after merge.
+    if sample_sizes is not None and len(sample_sizes) == 1:
+        global_sample_size = sample_sizes[0]
+        if global_sample_size is not None and global_sample_size < len(loaded_dataset):
+            print(f"Sampling {global_sample_size} examples from merged dataset...")
+            loaded_dataset = loaded_dataset.shuffle(seed=seed).select(range(global_sample_size))
+            print(f"Sampled dataset size: {len(loaded_dataset)}")
 
     # Skip train/val split if evaluation is disabled — use all data for training
     if skip_eval:
@@ -301,6 +350,65 @@ def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False):
             param.requires_grad = False
 
 
+def freeze_all_except_router(model):
+    """Freeze all parameters except MoE router gate weights."""
+    for name, param in model.named_parameters():
+        if ".mlp.gate.weight" in name:
+            param.requires_grad = True
+            print(f"[trainable-router] {name}")
+        else:
+            param.requires_grad = False
+
+
+def unfreeze_attention_layers(model):
+    """Unfreeze attention projection parameters by name heuristic."""
+    trainable_count = 0
+    attn_name_markers = (
+        ".self_attn.",
+        ".attn.",
+        ".attention.",
+    )
+    attn_proj_suffixes = (
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+        ".c_attn.",
+        ".c_proj.",
+        ".query_key_value.",
+        ".out_proj.",
+    )
+
+    for name, param in model.named_parameters():
+        if any(marker in name for marker in attn_name_markers) or any(suffix in name for suffix in attn_proj_suffixes):
+            if not param.requires_grad:
+                param.requires_grad = True
+            trainable_count += 1
+            print(f"[trainable-attn] {name}")
+
+    print(f"Unfroze attention parameters: {trainable_count}")
+
+
+def unfreeze_embedding_layers(model):
+    """Unfreeze token embedding parameters by name heuristic."""
+    trainable_count = 0
+    embed_name_markers = (
+        ".embed_tokens.",
+        ".word_embeddings.",
+        ".wte.",
+        ".tok_embeddings.",
+    )
+
+    for name, param in model.named_parameters():
+        if any(marker in name for marker in embed_name_markers):
+            if not param.requires_grad:
+                param.requires_grad = True
+            trainable_count += 1
+            print(f"[trainable-embed] {name}")
+
+    print(f"Unfroze embedding parameters: {trainable_count}")
+
+
 class ExpertSFTTrainer(SFTTrainer):
     """
     SFTTrainer subclass that zeroes out router gate gradients for all experts
@@ -335,6 +443,12 @@ def main():
     print("Parsed SFTConfig:", sft_config)
     print("SFTArgs:", sft_args)
 
+    if sft_args.router_tuning_only and sft_args.train_expert_idx is not None:
+        raise ValueError("router_tuning_only is incompatible with train_expert_idx because router tuning affects the routing gate of all experts, not just a single expert.")
+
+    if sft_args.router_tuning_only and sft_args.use_lora:
+        raise ValueError("router_tuning_only is incompatible with use_lora because LoRA introduces additional trainable parameters.")
+
     load_dotenv()
 
     run_id = sft_args.run_id
@@ -365,7 +479,12 @@ def main():
     # Expert freezing — must happen before LoRA so that PEFT sees the
     # correct requires_grad state when deciding which modules to wrap.
     # ------------------------------------------------------------------
-    if sft_args.train_expert_idx is not None:
+    if sft_args.router_tuning_only:
+        print("Freezing all weights except router gate weights.")
+        freeze_all_except_router(model)
+        model.enable_input_require_grads() # Need this to still build computational graph?
+        print_trainable_parameters(model)
+    elif sft_args.train_expert_idx is not None:
         print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
               f"({'LoRA adapters' if sft_args.use_lora else 'full fine-tune'}).")
         freeze_all_except_expert(
@@ -374,6 +493,14 @@ def main():
             use_lora=sft_args.use_lora,
         )
         model.enable_input_require_grads() # Need this to still build computational graph?
+
+    if sft_args.unfreeze_attn:
+        print("unfreeze_attn=True: unfreezing attention layers.")
+        unfreeze_attention_layers(model)
+
+    if sft_args.unfreeze_embed:
+        print("unfreeze_embed=True: unfreezing embedding layers.")
+        unfreeze_embedding_layers(model)
 
     # ------------------------------------------------------------------
     # LoRA setup
@@ -445,12 +572,13 @@ def main():
     # ------------------------------------------------------------------
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     lora_suffix = "_lora" if sft_args.use_lora else ""
+    router_suffix = "_router" if sft_args.router_tuning_only else ""
     expert_suffix = f"_expert{sft_args.train_expert_idx}" if sft_args.train_expert_idx is not None else ""
     run_output_dir = os.path.join(
         run_output_dir,
-        f"{run_id}{lora_suffix}{expert_suffix}_{model_name.replace('/', '_')}_{timestamp}"
+        f"{run_id}{lora_suffix}{router_suffix}{expert_suffix}_{model_name.replace('/', '_')}_{timestamp}"
     )
-    run_name = f"{run_id}{lora_suffix}{expert_suffix}_{timestamp}"
+    run_name = f"{run_id}{lora_suffix}{router_suffix}{expert_suffix}_{timestamp}"
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
     per_device_train_batch_size = sft_config.per_device_train_batch_size
@@ -494,6 +622,9 @@ def main():
         "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
         "initial_gpu_memory_gb": torch.cuda.memory_allocated() / 1024 ** 3 if torch.cuda.is_available() else 0,
         "use_lora": sft_args.use_lora,
+        "router_tuning_only": sft_args.router_tuning_only,
+        "unfreeze_attn": sft_args.unfreeze_attn,
+        "unfreeze_embed": sft_args.unfreeze_embed,
         **lora_stats,
     }
 
@@ -509,6 +640,10 @@ def main():
         callbacks=[WandbLoggingCallback(wandb_stats, train_examples_to_log, test_examples_to_log)],
         expert_idx=sft_args.train_expert_idx,
     )
+
+    # dataset = trainer.train_dataset
+    # print(dataset[0])
+    # quit()
 
     if not sft_args.skip_eval:
         trainer.evaluate()  # Evaluate once before training

@@ -1,11 +1,20 @@
 """
-Sample n random examples from one or more HuggingFace dataset repos and mix them together.
+Sample n random examples from one or more data sources and mix them together.
 Optionally format each sampled row into a "doc" column using a per-dataset template.
 You can also format from a prebuilt chat message column via a tokenizer chat template.
+
+Supported source types:
+  - Hugging Face dataset repo ID (existing behavior)
+  - Local .jsonl file path (new behavior)
 
 Usage (single dataset):
     python sample_hf_dataset.py \
         --repos stanfordnlp/imdb \
+        --n 100
+
+Usage (single local JSONL file):
+    python sample_hf_dataset.py \
+        --repos /path/to/local_dataset.jsonl \
         --n 100
 
 Usage (multiple datasets, mixed):
@@ -129,6 +138,30 @@ class DatasetConfig:
         )
 
 
+def _is_local_jsonl_source(source: str) -> bool:
+    return source.lower().endswith(".jsonl") and os.path.isfile(source)
+
+
+def _load_jsonl_rows(path: str) -> list[dict]:
+    rows: list[dict] = []
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in '{path}' at line {line_no}: {e}") from e
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"Expected JSON object per line in '{path}', line {line_no}, "
+                    f"got {type(parsed).__name__}."
+                )
+            rows.append(parsed)
+    return rows
+
+
 def _render_chat_template(
     row: dict,
     chat_messages_column: str,
@@ -166,27 +199,45 @@ def sample_one(
     seed: int | None,
     tokenizer_cache: dict[str, AutoTokenizer],
 ) -> list[dict]:
-    """Load a single dataset and return cfg.n random samples as plain dicts."""
-    label = f"'{cfg.repo}'" + (f" ({cfg.config})" if cfg.config else "")
-    print(f"  Loading {label} split='{cfg.split}' n={cfg.n} ...")
-
-    if cfg.streaming:
-        ds = load_dataset(cfg.repo, cfg.config, split=cfg.split, streaming=True)
-        buffer_size = max(cfg.n * 10, 10_000)
-        ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
-        samples = [dict(example) for _, example in zip(range(cfg.n), ds)]
-    else:
-        ds = load_dataset(cfg.repo, cfg.config, split=cfg.split)
-        total = len(ds)
-        if cfg.n > total:
-            print(f"  Warning: requested {cfg.n} but '{cfg.repo}' only has {total}. Using all.")
-            cfg.n = total
+    """Load a single source and return cfg.n random samples as plain dicts."""
+    n_requested = cfg.n
+    is_local_jsonl = _is_local_jsonl_source(cfg.repo)
+    if is_local_jsonl:
+        label = f"local jsonl '{cfg.repo}'"
+        print(f"  Loading {label} n={n_requested} ...")
+        rows = _load_jsonl_rows(cfg.repo)
+        total = len(rows)
+        if n_requested > total:
+            print(f"  Warning: requested {n_requested} but source has {total}. Using all.")
+            n_requested = total
         rng = random.Random(seed)
-        indices = rng.sample(range(total), cfg.n)
-        samples = [dict(ds[i]) for i in sorted(indices)]
+        indices = rng.sample(range(total), n_requested)
+        samples = [rows[i] for i in sorted(indices)]
+    else:
+        label = f"'{cfg.repo}'" + (f" ({cfg.config})" if cfg.config else "")
+        print(f"  Loading {label} split='{cfg.split}' n={n_requested} ...")
+
+        if cfg.streaming:
+            ds = load_dataset(cfg.repo, cfg.config, split=cfg.split, streaming=True)
+            buffer_size = max(n_requested * 10, 10_000)
+            ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
+            samples = [dict(example) for _, example in zip(range(n_requested), ds)]
+        else:
+            ds = load_dataset(cfg.repo, cfg.config, split=cfg.split)
+            total = len(ds)
+            if n_requested > total:
+                print(f"  Warning: requested {n_requested} but '{cfg.repo}' only has {total}. Using all.")
+                n_requested = total
+            rng = random.Random(seed)
+            indices = rng.sample(range(total), n_requested)
+            samples = [dict(ds[i]) for i in sorted(indices)]
 
     # Build output records: {id, doc}
-    dataset_slug = re.sub(r'[^a-z0-9]+', '_', cfg.repo.lower()).strip('_')
+    if is_local_jsonl:
+        source_name = os.path.splitext(os.path.basename(cfg.repo))[0]
+    else:
+        source_name = cfg.repo
+    dataset_slug = re.sub(r'[^a-z0-9]+', '_', source_name.lower()).strip('_')
     records = []
     for idx, row in enumerate(samples):
         if cfg.chat_messages_column is not None:
@@ -313,7 +364,7 @@ def main():
     # --- source spec (mutually exclusive: CLI flags vs JSON config file) ---
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--repos", nargs="+", metavar="REPO",
-                     help="One or more HuggingFace repo IDs")
+                     help="One or more sources: HuggingFace repo IDs and/or local .jsonl file paths")
     src.add_argument("--config-file", metavar="FILE",
                      help="JSON file describing datasets (see schema in module docstring)")
 

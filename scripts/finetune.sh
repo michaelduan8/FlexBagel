@@ -78,3 +78,27 @@ PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=$num_gpus train/finetune.p
     --train_expert_idx 1
 
     #    --dataset_num_proc 6 \
+
+
+echo Training fino1 expert, no router temp
+PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=4 train/finetune.py \
+    --run_id "fino1_qwen2_5-1_5b_expert_no_temp" \
+    --model /scratch1/duanm/flex_experts/text_only_warmup/medr1_fino1_qwen2_5-3x1_5b/ \
+    --datasets "traces/text_only_warmup/fino1_finqa/fino1_finqa_traces.jsonl" "traces/text_only_warmup/med_r1/med_r1_traces.jsonl" \
+    --sample_size 500 500 \
+    --num_train_epochs 5 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --logging_steps 10 \
+    --learning_rate 1e-4 \
+    --warmup_ratio 0.1 \
+    --gradient_checkpointing \
+    --max_length 20000 \
+    --run_seed 2026 \
+    --run_output_dir "/scratch1/duanm/flex_experts/text_only_warmup/medr1_fino1_qwen2_5-3x1_5b_router_posttune/" \
+    --save_n_epochs 2 \
+    --dataset_num_proc 6 \
+    --deepspeed "train/ds_config/v0.json" \
+    --skip_eval \
+    --router_tuning_only
