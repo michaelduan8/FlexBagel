@@ -25,11 +25,6 @@ class SFTArgs:
     run_id: str = field(metadata={"help": "ID for the training run"})
     model: str = field(metadata={"help": "Model to use for training"})
     datasets: list[str] = field(metadata={"help": "Dataset(s) to use for training"})
-    dataset_args: list[str] = field(
-        default=None,
-        metadata={"help": "Optional per-dataset load arguments. Must be None or a list with one JSON object per dataset "
-                          "(same length as `datasets`). Example item: '{\"split\": \"train\", \"subset\": \"default\"}'."}
-    )
     run_seed: int = field(default=2025, metadata={"help": "Random seed for training"})
     run_output_dir: str = field(default="./checkpoints", metadata={"help": "Directory to save training runs"})
     sample_size: list[int] = field(
@@ -80,103 +75,42 @@ def register_local_architectures():
     print("Registering local architectures...")
 
 
-# def get_dataset_stats(dataset, tokenizer, name):
-#     """Tokenizes a dataset and returns statistics about token lengths."""
-
-#     def get_token_length(example):
-#         prompt = example["prompt"]
-#         completion = example["completion"]
-#         conversation = prompt + completion
-#         full_conversation_tokens = tokenizer.apply_chat_template(
-#             conversation,
-#             tokenize=True,
-#             add_generation_prompt=False
-#         )
-#         return {"token_length": len(full_conversation_tokens)}
-
-#     print(f"Analyzing token lengths for {name} set...")
-#     processed = dataset.map(get_token_length, num_proc=4)
-
-#     token_lengths = [count for count in processed["token_length"]]
-
-#     stats = {
-#         f"{name.lower()}_avg_tokens": np.mean(token_lengths),
-#         f"{name.lower()}_max_tokens": np.max(token_lengths),
-#         f"{name.lower()}_min_tokens": np.min(token_lengths),
-#         f"{name.lower()}_75th_percentile_tokens": np.percentile(token_lengths, 75),
-#         f"{name.lower()}_90th_percentile_tokens": np.percentile(token_lengths, 90),
-#     }
-
-#     print(f"--- {name} Set Token Stats ---")
-#     for key, value in stats.items():
-#         print(f"{key}: {value:.2f}")
-#     print("-----------------------------------")
-#     return stats, token_lengths
-
-
-IMAGE_DIR = "/scratch1/duanm/data/pubmed_vision/"
 def preprocess_dataset(dataset):
     """Convert dataset to conversational prompt-completion format for SFTTrainer."""
-    mb = float(1024 ** 2)
-    a100_bytes = int(80 * (1024 ** 3))
-    # Reserve most VRAM for model/optimizer/activations and only allow a bounded image-memory budget.
-    image_budget_ratio = float(os.getenv("A100_IMAGE_MEMORY_BUDGET_RATIO", "0.15"))
-    image_budget_bytes = int(32 * mb) #int(a100_bytes * image_budget_ratio)
-    # Conservative multiplier for additional training-time image activation buffers.
-    image_training_overhead = float(os.getenv("IMAGE_TRAINING_OVERHEAD_MULTIPLIER", "16.0"))
-
-    print(
-        "Image memory filter enabled: "
-        f"budget={image_budget_bytes / mb:.2f} MB "
-        f"({image_budget_ratio:.0%} of 80GB), "
-        f"overhead_multiplier={image_training_overhead:.2f}"
-    )
-
-    def estimate_training_image_bytes(image_obj):
-        # Normalize to 3 channels to match later RGB conversion.
-        width, height = image_obj.size
-        rgb_pixels = width * height * 3
-        # Most modern training runs use bf16/fp16 (2 bytes); keep this conservative via overhead multiplier.
-        bf16_tensor_bytes = rgb_pixels * 2
-        return int(bf16_tensor_bytes * image_training_overhead)
 
     def load_bytes(item):
-        assert "image" in item, "Item must contain 'image' key"
+        assert "images" in item, "Item must contain 'images' key"
         loaded = []
         estimated_total_image_bytes = 0
         widths = []
         heights = []
-        dropped_for_memory = False
+        sizes = []
 
-        for img_path in item["image"]:
+        for img_path in item["images"]:
             try:
-                full_path = os.path.join(IMAGE_DIR, img_path)
-                with open(full_path, "rb") as f:
+                with open(img_path, "rb") as f:
                     img_bytes = f.read()
 
                 with PILImage.open(io.BytesIO(img_bytes)) as img:
                     width, height = img.size
                     widths.append(width)
                     heights.append(height)
-                    estimated_total_image_bytes += estimate_training_image_bytes(img)
+                    size_mb = len(img_bytes) / (1024 * 1024)
+                    sizes.append(size_mb)
 
                 loaded.append(img_bytes)
             except Exception as e:
                 print(f"Error loading image {img_path}: {e}")
                 loaded.append(None)
 
-        if estimated_total_image_bytes > image_budget_bytes:
-            dropped_for_memory = True
-
         item["image_bytes"] = loaded
-        item["estimated_image_training_bytes"] = estimated_total_image_bytes
         item["image_widths"] = widths
         item["image_heights"] = heights
-        item["fits_a100_image_budget"] = not dropped_for_memory
+        item["image_sizes"] = sizes
         return item
 
     def convert_row(item):
-        assert "image_bytes" in item and "conversations" in item and "id" in item
+        assert "images" in item and "conversation" in item and "id" in item
 
         # Convert bytes → PIL here, no multiprocessing so no pickling issues
         # images = []
@@ -186,135 +120,81 @@ def preprocess_dataset(dataset):
         #         images.append(image)
         #     except Exception as e:
         #         print(f"Error converting image: {e}")
-        rgb_bytes = []
-        try:
-            for b in item["image_bytes"]:
-                img = PILImage.open(io.BytesIO(b))
-                if img.mode != "RGB":
-                    # Only re-encode if we actually need to convert the mode
-                    img = img.convert("RGB")
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=100)
-                    rgb_bytes.append(buf.getvalue())
-                else:
-                    rgb_bytes.append(b)
-        except Exception as e:
-            print(f"Error processing image bytes for item {item['id']}: {e}")
+        #rgb_bytes = []
+        # image_widths = []
+        # image_heights = []
+        # img_sizes = []
+        # try:
+        #     for img_bytes in item["image_bytes"]:
+        #         img = PILImage.open(io.BytesIO(img_bytes))
+        #         if img.mode != "RGB":
+        #             # Only re-encode if we actually need to convert the mode
+        #             img = img.convert("RGB")
+        #             buf = io.BytesIO()
+        #             img.save(buf, format="PNG")
+        #             # rgb_bytes.append(buf.getvalue())
+        #             rgb_bytes.append(buf.getvalue())
+        #         else:
+        #             rgb_bytes.append(img_bytes)
+        #         # image_widths.append(img.width)
+        #         # image_heights.append(img.height)
+        #         # img_sizes.append(len(rgb_bytes[-1]) / (1024 * 1024))
+        # except Exception as e:
+        #     print(f"Error processing image bytes for item {item['id']}: {e}")
 
         id = item["id"]
-        conversations = item["conversations"]
-        assert conversations[-1]["from"] == "gpt"
-        assert len(conversations) <= 3
+        conversation = item["conversation"]
+        assert conversation[-1]["role"] == "assistant"
+        assert len(conversation) <= 3
+
+        images = item["images"]
 
         prompt = []
-        for turn in conversations[:-1]:
-            assert turn["from"] != "gpt"
-            if turn["from"] == "human":
-                role = "user"
-                content = [{"type": "image"} for _ in rgb_bytes] + [
-                    {"type": "text", "text": turn["value"]}
-                ]
+        # TODO: not sure how to handle multiturn data
+        for turn in conversation[:-1]:
+            if turn["role"] == "user" and turn["img_loc"] is not None:
+                content = [{"type": "text", "text": turn["content"]}]
+                #content = [{"type": "image"} for _ in rgb_bytes] + content if turn["img_loc"] == "before" else content + [{"type": "image"} for _ in rgb_bytes]
+                content = [{"type": "image"} for _ in images] + content if turn["img_loc"] == "before" else content + [{"type": "image"} for _ in images]
             else:
-                role = turn["from"]
-                content = [{"type": "text", "text": turn["value"]}]
-            prompt.append({"role": role, "content": content})
+                content = [{"type": "text", "text": turn["content"]}]
+            prompt.append({"role": turn["role"], "content": content})
 
         return {
             "prompt_id": id,
             "prompt": prompt,
-            "completion": [{"role": "assistant", "content": [{"type": "text", "text": conversations[-1]["value"]}]}],
+            "completion": [{"role": "assistant", "content": [{"type": "text", "text": conversation[-1]["content"]}]}],
             # TODO: could be ok to not have images?
-            "images": [{"bytes": b, "path": None} for b in rgb_bytes] if rgb_bytes else None,
+            # "images": [{"bytes": b, "path": None} for b in rgb_bytes] if rgb_bytes else None,
+            "images": [{"bytes": None, "path": img_path} for img_path in images] if images else None,
         }
 
-    # batched=True, batch_size=2,
-    pre_count = len(dataset)
-    dataset = dataset.map(load_bytes, num_proc=12).filter(lambda x: x["image_bytes"] is not None)
-
-    estimated_bytes_all = dataset["estimated_image_training_bytes"]
-    if len(estimated_bytes_all) > 0:
-        avg_bytes_all = float(np.mean(estimated_bytes_all))
-        std_bytes_all = float(np.std(estimated_bytes_all))
-        print(
-            "Image memory estimate stats (all processed samples): "
-            f"n={len(estimated_bytes_all)}, "
-            f"avg={avg_bytes_all / mb:.3f} MB, "
-            f"std={std_bytes_all / mb:.3f} MB"
-        )
-
-    widths_all = [w for row in dataset["image_widths"] for w in row]
-    heights_all = [h for row in dataset["image_heights"] for h in row]
-    if len(widths_all) > 0 and len(heights_all) > 0:
-        avg_width_all = float(np.mean(widths_all))
-        std_width_all = float(np.std(widths_all))
-        avg_height_all = float(np.mean(heights_all))
-        std_height_all = float(np.std(heights_all))
-        print(
-            "Image dimension stats (all processed images): "
-            f"n={len(widths_all)}, "
-            f"width_avg={avg_width_all:.1f}px, width_std={std_width_all:.1f}px, "
-            f"height_avg={avg_height_all:.1f}px, height_std={std_height_all:.1f}px"
-        )
-
-    dataset = dataset.filter(lambda x: x["fits_a100_image_budget"], num_proc=12)
-    print(f"Filtered oversized image examples for A100-80GB fit: {pre_count} -> {len(dataset)} rows")
-
-    estimated_bytes_kept = dataset["estimated_image_training_bytes"]
-    if len(estimated_bytes_kept) > 0:
-        avg_bytes_kept = float(np.mean(estimated_bytes_kept))
-        std_bytes_kept = float(np.std(estimated_bytes_kept))
-        print(
-            "Image memory estimate stats (kept samples): "
-            f"n={len(estimated_bytes_kept)}, "
-            f"avg={avg_bytes_kept / mb:.3f} MB, "
-            f"std={std_bytes_kept / mb:.3f} MB"
-        )
-
-    widths_kept = [w for row in dataset["image_widths"] for w in row]
-    heights_kept = [h for row in dataset["image_heights"] for h in row]
-    if len(widths_kept) > 0 and len(heights_kept) > 0:
-        avg_width_kept = float(np.mean(widths_kept))
-        std_width_kept = float(np.std(widths_kept))
-        avg_height_kept = float(np.mean(heights_kept))
-        std_height_kept = float(np.std(heights_kept))
-        print(
-            "Image dimension stats (kept images): "
-            f"n={len(widths_kept)}, "
-            f"width_avg={avg_width_kept:.1f}px, width_std={std_width_kept:.1f}px, "
-            f"height_avg={avg_height_kept:.1f}px, height_std={std_height_kept:.1f}px"
-        )
-
-    dataset = dataset.remove_columns(
-        [
-            "image",
-            "estimated_image_training_bytes",
-            "image_widths",
-            "image_heights",
-            "fits_a100_image_budget",
-        ]
-    )
-    print(dataset)
+    #dataset = dataset.map(load_bytes, num_proc=24)
     dataset = dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=12).filter(lambda x: x["images"] is not None)
     dataset = dataset.cast_column("images", Sequence(Image()))
+
+    # widths_kept = [w for row in dataset["image_widths"] for w in row]
+    # heights_kept = [h for row in dataset["image_heights"] for h in row]
+    # sizes_kept = [s for row in dataset["image_sizes"] for s in row]
+    # if len(widths_kept) > 0 and len(heights_kept) > 0:
+    #     avg_width_kept = float(np.mean(widths_kept))
+    #     std_width_kept = float(np.std(widths_kept))
+    #     avg_height_kept = float(np.mean(heights_kept))
+    #     std_height_kept = float(np.std(heights_kept))
+    #     avg_size_kept = float(np.mean(sizes_kept))
+    #     std_size_kept = float(np.std(sizes_kept))
+    #     print(
+    #         "Image dimension stats (kept images): "
+    #         f"n={len(widths_kept)}, "
+    #         f"width_avg={avg_width_kept:.1f}px, width_std={std_width_kept:.1f}px, "
+    #         f"height_avg={avg_height_kept:.1f}px, height_std={std_height_kept:.1f}px, "
+    #         f"size_avg={avg_size_kept:.2f}MB, size_std={std_size_kept:.2f}MB"
+    #     )
+
     return dataset
 
 
-def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_eval=False, dataset_args=None):
-    if dataset_args is None:
-        parsed_dataset_args = [None] * len(datasets)
-    else:
-        parsed_dataset_args = list(dataset_args)
-        if len(parsed_dataset_args) != len(datasets):
-            raise ValueError(
-                f"dataset_args must be None or a list with one value per dataset "
-                f"(got {len(parsed_dataset_args)} values for {len(datasets)} datasets)."
-            )
-
-        parsed_dataset_args = [
-            json.loads(item) if item is not None else None
-            for item in parsed_dataset_args
-        ]
-
+def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_eval=False):
     if sample_size is not None:
         if isinstance(sample_size, int):
             sample_sizes = [sample_size]
@@ -335,29 +215,23 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
     for idx, dataset_name in enumerate(datasets):
         print(f"Loading dataset: {dataset_name}")
 
-        dataset_kwargs = dict(parsed_dataset_args[idx] or {})
-        split = dataset_kwargs.pop("split", "train")
-        subset = dataset_kwargs.pop("subset", None)
-        if subset is not None:
-            dataset_kwargs["name"] = subset
-
         if "jsonl" in dataset_name:
-            dataset = load_dataset("json", data_files=dataset_name, split=split, **dataset_kwargs)
+            dataset = load_dataset("json", data_files=dataset_name, split="train")
         elif "parquet" in dataset_name:
-            dataset = load_dataset("parquet", data_files=dataset_name, split=split, **dataset_kwargs)
+            dataset = load_dataset("parquet", data_files=dataset_name, split="train")
         else:
-            dataset = load_dataset(dataset_name, split=split, **dataset_kwargs)
+            dataset = load_dataset(dataset_name, split="train")
 
         # Remove rows with too many images:
-        print("Filtering out rows with more than 1 images...")
-        pre = len(dataset)
-        dataset = dataset.filter(
-            lambda x: len(x["image"]) <= 1
-        )
-        print(f"Filtered: {pre} -> {len(dataset)} rows")
+        # print("Filtering out rows with more than 1 images...")
+        # pre = len(dataset)
+        # dataset = dataset.filter(
+        #     lambda x: len(x["image"]) <= 1
+        # )
+        # print(f"Filtered: {pre} -> {len(dataset)} rows")
 
         # Per-dataset sampling: one sample size per dataset path.
-        if sample_sizes is not None and len(sample_sizes) == len(datasets):
+        if sample_sizes is not None and len(sample_sizes) == len(datasets) and len(sample_sizes) > 1:
             dataset_sample_size = sample_sizes[idx]
             if dataset_sample_size is not None and dataset_sample_size < len(dataset):
                 print(f"Sampling {dataset_sample_size} examples from dataset[{idx}]...")
@@ -365,17 +239,17 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
             
             print(f"Sampled dataset[{idx}] size: {len(dataset)}")
 
-        loaded_dataset.append(dataset)
+        loaded_dataset.append(preprocess_dataset(dataset))
     
     loaded_dataset = concatenate_datasets(loaded_dataset)
 
     # Apply id substring filter before any further processing
-    if filter_by_id is not None:
-        pre = len(loaded_dataset)
-        loaded_dataset = loaded_dataset.filter(
-            lambda x: any(s in x["prompt_id"] for s in filter_by_id)
-        )
-        print(f"Filtered: {pre} -> {len(loaded_dataset)} rows")
+    # if filter_by_id is not None:``
+    #     pre = len(loaded_dataset)
+    #     loaded_dataset = loaded_dataset.filter(
+    #         lambda x: any(s in x["prompt_id"] for s in filter_by_id)
+    #     )
+    #     print(f"Filtered: {pre} -> {len(loaded_dataset)} rows")
 
     print("Shuffling Dataset...")
     loaded_dataset = loaded_dataset.shuffle(seed=seed) 
@@ -389,9 +263,6 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
             print(f"Sampling {global_sample_size} examples from merged dataset...")
             loaded_dataset = loaded_dataset.select(range(global_sample_size))
             print(f"Sampled dataset size: {len(loaded_dataset)}")
-
-    # Now preprocess dataset
-    loaded_dataset = preprocess_dataset(loaded_dataset)
 
     # Skip train/val split if evaluation is disabled — use all data for training
     if skip_eval:
@@ -718,7 +589,7 @@ def main():
     # ------------------------------------------------------------------
     # Dataset preparation
     # ------------------------------------------------------------------
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_rank = sft_config.local_rank
     if local_rank == 0:
         train_dataset, test_dataset = prepare_datasets(
             datasets,
@@ -726,7 +597,6 @@ def main():
             sample_size=sft_args.sample_size,
             filter_by_id=sft_args.filter_by_id,
             skip_eval=sft_args.skip_eval,
-            dataset_args=sft_args.dataset_args,
         )
 
     dist.barrier()
@@ -738,7 +608,6 @@ def main():
             sample_size=sft_args.sample_size,
             filter_by_id=sft_args.filter_by_id,
             skip_eval=sft_args.skip_eval,
-            dataset_args=sft_args.dataset_args,
         )
 
     # train_stats, _ = get_dataset_stats(train_dataset, tokenizer, "Train")
@@ -805,7 +674,6 @@ def main():
 
     wandb_stats = {
         "sample_size": sft_args.sample_size,
-        "dataset_args": sft_args.dataset_args,
         "filter_by_id": sft_args.filter_by_id,
         "train_dataset_size": len(train_dataset),
         "test_dataset_size": len(test_dataset) if test_dataset is not None else 0,
@@ -836,7 +704,6 @@ def main():
 
     if local_rank != 0:
         # Let the remainder of the workers load from HF Cache
-        # sft_config.dataset_num_proc = 1  # Avoid multiple processes doing redundant preprocessing
         trainer = SFTTrainer(
             model=model,
             args=sft_config,

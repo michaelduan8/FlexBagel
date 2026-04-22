@@ -40,26 +40,42 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
     Per row, we remap the conversation and image metadata
     """
     id = row["id"]
-    subject_id = id.split('_')[0][1:]
+    image = os.path.join(raw_data_dir, row["image"])
+    
+    row["images"] = [image]
 
-    accession_number = row["AccessionNumber"]
-    study_id = row["StudyInstanceUid"]
+    conversation = row["conversations"]
 
-    images = glob.glob(os.path.join(raw_data_dir, subject_id, accession_number, 'studies', study_id, 'series', '*', 'instances', '*'))
-    images = list(images)
-    assert len(images) > 0, f"No images found for row with id {id} in raw data directory {raw_data_dir}."
+    parsed = []
+    counter = 0
+    for turn in conversation:
+        role = "user" if turn["from"] == "human" else "assistant"
+        content = turn["value"]
 
-    row["images"] = images
+        img_loc = None
+        if "<image>" in content:
+            assert role == "user", f"Expected image tag to only appear in user turns, but found in assistant turn in row with id {id}."
+            counter += 1
+            if content.startswith("<image>"):
+                img_loc = "before"
+            elif content.endswith("<image>"):
+                img_loc = "after"
+            else:
+                raise ValueError(f"Unexpected image tag location in conversation content: {content}")
 
-    patient_data = f"Sex: {row['PatientSex']}\n\nAge: {row['PatientAge']}\n\nDescription: {row['StudyDescription']}\n\nIndication: {row['Indication']}"
-    report = f"Findings: {row['Findings']}\n\nImpression: {row['Impression']}"
+            content = content.replace("<image>", "").strip()
+        
+        parsed_turn = {
+            "role": role,
+            "content": content,
+            "img_loc": img_loc,
+        }
 
-    conversation = [
-        {"role": "user", "content": f"Please generate a radiology report using the above images collected from a patient study.\n\nPatient Study Details:\n\n{patient_data}", "img_loc": "before"},
-        {"role": "assistant", "content": report, "img_loc": None},
-    ]
+        parsed.append(parsed_turn)
+    
+    assert counter == 1, f"Expected exactly one image tag in conversation content, but found {counter} in row with id {id}."
 
-    row["conversation"] = conversation
+    row["conversation"] = parsed
 
     return row
 
@@ -72,10 +88,16 @@ def main() -> None:
     output = Path(args.output)
     raw_data_dir = Path(args.raw_data_dir)
 
-    dataset = load_dataset(dataset_path, split=split)
+    #dataset = load_dataset(dataset_path, split=split)
+    dataset = load_dataset("json", data_files=str(dataset_path), split="train")
+    dataset = dataset.filter(
+        lambda row, raw_data_dir: os.path.exists(os.path.join(raw_data_dir, row["image"])),
+        fn_kwargs={"raw_data_dir": raw_data_dir},
+        num_proc=12,
+    )
     mapped_dataset = dataset.map(
         map_row, 
-        fn_kwargs={"raw_data_dir": raw_data_dir}, 
+        fn_kwargs={"raw_data_dir": raw_data_dir},
         remove_columns=dataset.column_names, 
         num_proc=12
     )

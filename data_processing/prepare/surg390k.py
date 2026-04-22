@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-from data_processing.utils import load_json, write
+from datasets import load_dataset
+
+
+def normalize_image_path(image: str, raw_data_dir: Path) -> str:
+    normalized_image = os.path.join(raw_data_dir, image.split("finetune_data/")[-1])
+    if "EndoVis-VQLA" in normalized_image:
+        normalized_image = normalized_image.replace("EndoVis-VQLA", "EndoVis_part")
+    return normalized_image
+
+
+def row_has_existing_image(row: dict[str, Any], raw_data_dir: Path) -> bool:
+    return os.path.exists(normalize_image_path(row["image"], raw_data_dir))
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -29,19 +41,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def map_row(idx: int, row: dict[str, Any], raw_data_dir: Path) -> dict[str, Any]:
+def map_row(row: dict[str, Any], idx: int, raw_data_dir: Path) -> dict[str, Any]:
     """
     Per row, we remap the conversation and image metadata
     """
-    out = {}
-    out["id"] = f"surg390k-{idx:06d}"
-    
     image = row["image"]
     conversation = row["conversations"]
 
     # normalize image to local directory
-    normalized_image = os.path.join(raw_data_dir, image.split("finetune_data/")[-1])
-    assert os.path.exists(normalized_image), f"Image file {normalized_image} does not exist."
+    normalized_image = normalize_image_path(image, raw_data_dir)
+
+    out = {}
+    out["id"] = f"surg390k-{idx:06d}"
 
     out["images"] = [normalized_image]
 
@@ -50,18 +61,31 @@ def map_row(idx: int, row: dict[str, Any], raw_data_dir: Path) -> dict[str, Any]
         role = "user" if turn["from"] == "human" else "assistant"
         content = turn["value"]
 
-        normalized_conversation.append({"role": role, "content": content})
+        parsed_turn = {
+            "role": role,
+            "content": content,
+        }
+        if role == "user":
+            parsed_turn["img_loc"] = "before"
+        else:
+            parsed_turn["img_loc"] = None
+            
+        normalized_conversation.append(parsed_turn)
+
+    assert len(normalized_conversation) == 2, f"Expected exactly 2 turns in conversation, but found {len(normalized_conversation)} in row with id {out['id']}."
 
     out["conversation"] = normalized_conversation
 
     # Save remaining keys as metadata if they exist
-    metadata = {
-        key: value
-        for key, value in row.items()
-        if key not in {"image", "conversations"}
-    }
-    if metadata:
-        out["metadata"] = metadata
+    # metadata = {
+    #     key: value
+    #     for key, value in row.items()
+    #     if key not in {"image", "conversations"}
+    # }
+    # if metadata:
+    #     out["metadata"] = metadata
+    # else:
+    #     out["metadata"] = None
 
     return out
 
@@ -73,12 +97,24 @@ def main() -> None:
     output = Path(args.output)
     raw_data_dir = Path(args.raw_data_dir)
 
-    metadata = load_json(input)
-    mapped_records = [map_row(idx, row, raw_data_dir) for idx, row in enumerate(metadata)]
-    write(output, mapped_records)
+    dataset = load_dataset("json", data_files=str(input), split="train")
+    dataset = dataset.filter(
+        row_has_existing_image,
+        fn_kwargs={"raw_data_dir": raw_data_dir},
+        num_proc=12,
+    )
+    mapped_dataset = dataset.map(
+        map_row,
+        fn_kwargs={"raw_data_dir": raw_data_dir},
+        with_indices=True,
+        remove_columns=dataset.column_names,
+        num_proc=12,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    mapped_dataset.to_json(str(output), orient="records", lines=True)
 
     print(
-        f"Converted {len(mapped_records)} rows from {input} "
+        f"Converted {len(mapped_dataset)} rows from {input} "
         f"to {output} (raw_data_dir={raw_data_dir})."
     )
 
