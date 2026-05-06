@@ -88,8 +88,8 @@ def main() -> None:
     output = Path(args.output)
     raw_data_dir = Path(args.raw_data_dir)
 
-    #dataset = load_dataset(dataset_path, split=split)
-    dataset = load_dataset("json", data_files=str(dataset_path), split="train")
+    dataset = load_dataset(dataset_path, data_files="quilt_instruct_107k.json", split=split)
+    # dataset = load_dataset("json", data_files=str(dataset_path), split="train")
     dataset = dataset.filter(
         lambda row, raw_data_dir: os.path.exists(os.path.join(raw_data_dir, row["image"])),
         fn_kwargs={"raw_data_dir": raw_data_dir},

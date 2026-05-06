@@ -19,6 +19,8 @@ from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image as PILImage
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback
 from trl import SFTTrainer, SFTConfig
+from transformers.trainer_utils import get_last_checkpoint
+import shutil
 
 @dataclass
 class SFTArgs:
@@ -69,6 +71,47 @@ class SFTArgs:
         metadata={"help": "Target modules for LoRA. If None, uses default for the model architecture."}
     )
     merge_and_save: bool = field(default=False, metadata={"help": "Merge LoRA weights into base model and save full model"})
+    auto_resume: bool = field(
+        default=True,
+        metadata={"help": "Automatically resume from the latest checkpoint in run_output_dir/run_id if it exists."}
+    )
+    resume_from_checkpoint: str = field(
+        default=None,
+        metadata={"help": "Explicit checkpoint path to resume from. Overrides auto_resume."}
+    )
+    delete_intermediate_checkpoints: bool = field(
+        default=True,
+        metadata={"help": "Delete checkpoint-* directories after successful training completion."}
+    )
+
+
+def delete_intermediate_checkpoints(checkpoint_path, keep_final=True):
+    """
+    Delete Hugging Face intermediate checkpoint-* directories after training completes.
+
+    Keeps:
+      - final/ directory
+      - non-checkpoint files in checkpoint_path
+
+    Deletes:
+      - checkpoint-100/
+      - checkpoint-200/
+      - etc.
+    """
+    checkpoint_path = pathlib.Path(checkpoint_path)
+
+    if not checkpoint_path.exists():
+        print(f"No checkpoint path found: {checkpoint_path}")
+        return
+
+    deleted = 0
+    for child in checkpoint_path.iterdir():
+        if child.is_dir() and child.name.startswith("checkpoint-"):
+            print(f"Deleting intermediate checkpoint: {child}")
+            shutil.rmtree(child)
+            deleted += 1
+
+    print(f"Deleted {deleted} intermediate checkpoint directories.")
 
 
 def register_local_architectures():
@@ -769,6 +812,19 @@ def main():
     checkpoint_path = paths["checkpoints"]
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
+    resume_checkpoint = None
+
+    if sft_args.resume_from_checkpoint is not None:
+        resume_checkpoint = sft_args.resume_from_checkpoint
+    elif sft_args.auto_resume:
+        resume_checkpoint = get_last_checkpoint(str(checkpoint_path))
+
+    if local_rank in (-1, 0):
+        if resume_checkpoint is not None:
+            print(f"Auto-resuming from checkpoint: {resume_checkpoint}")
+        else:
+            print("No existing checkpoint found. Starting from scratch.")
+
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
     per_device_train_batch_size = sft_config.per_device_train_batch_size
@@ -882,7 +938,7 @@ def main():
         trainer.evaluate()  # Evaluate once before training
 
     print("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     final_output_dir = os.path.join(str(checkpoint_path), "final")
 
     if sft_args.use_lora and sft_args.merge_and_save:
@@ -899,6 +955,11 @@ def main():
 
     if not sft_args.skip_eval:
         trainer.evaluate()  # Final evaluation after training
+
+    if sft_args.delete_intermediate_checkpoints:
+        if local_rank in (-1, 0):
+            print("Training completed successfully. Deleting intermediate checkpoints...")
+            delete_intermediate_checkpoints(checkpoint_path)
 
     wandb.finish()
     
