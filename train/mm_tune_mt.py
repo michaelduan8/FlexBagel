@@ -890,10 +890,12 @@ def main():
         merged_model = model.merge_and_unload()
         merged_model.save_pretrained(final_output_dir)
         tokenizer.save_pretrained(final_output_dir)
+        processor.save_pretrained(final_output_dir)
         print(f"Merged model saved to {final_output_dir}")
     else:
         trainer.save_model(output_dir=final_output_dir)
         tokenizer.save_pretrained(final_output_dir)
+        processor.save_pretrained(final_output_dir)
         if sft_args.use_lora:
             print(f"LoRA adapter saved to {final_output_dir}")
 
