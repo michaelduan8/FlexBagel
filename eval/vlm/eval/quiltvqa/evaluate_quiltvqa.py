@@ -158,7 +158,7 @@ def save_results(results: list[ResultEntry], folder: str) -> str:
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "test_result.json")
     with open(path, "w") as f:
-        json.dump([r.to_dict() for r in results], f, indent=4)
+        json.dump(results, f, indent=4)
     return path
 
 
@@ -185,6 +185,7 @@ def main() -> None:
     # TODO: add outputs to test_metadata
     for meta, res in zip(test_metadata, results):
         output = res.outputs[0].text.strip()
+        meta.pop("query")  # remove query to save space
         meta["answer"] = output
 
     result_path = save_results(test_metadata, args.result_folder)

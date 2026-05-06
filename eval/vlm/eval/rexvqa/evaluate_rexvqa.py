@@ -51,7 +51,7 @@ def load_model(model_id: str) -> LLM:
         trust_remote_code=True,
         dtype="bfloat16",
         max_model_len=8192,
-        limit_mm_per_prompt={"image": 20},
+        limit_mm_per_prompt={"image": 25},
     )
 
 
@@ -69,7 +69,14 @@ def load_test_data(path: str) -> list[dict]:
             if not line:
                 continue
             try:
-                items.append(json.loads(line))
+                line = json.loads(line)
+                if len(line["images"]) > 10:
+                    print(len(line["images"]))
+                    print(line["conversation"])
+                    print(f"Skipping item with more than 10 images (id={line['id']})")
+                    continue
+
+                items.append(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSONL at {path}:{line_number}") from exc
         return items
