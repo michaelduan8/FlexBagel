@@ -5,8 +5,6 @@ import pathlib
 import random
 import sys
 import torch
-import torch.distributed as dist
-#dist.init_process_group(backend="nccl")
 
 import wandb
 import json
@@ -589,26 +587,13 @@ def main():
     # ------------------------------------------------------------------
     # Dataset preparation
     # ------------------------------------------------------------------
-    local_rank = sft_config.local_rank
-    if local_rank == 0:
-        train_dataset, test_dataset = prepare_datasets(
-            datasets,
-            seed=run_seed,
-            sample_size=sft_args.sample_size,
-            filter_by_id=sft_args.filter_by_id,
-            skip_eval=sft_args.skip_eval,
-        )
-
-    dist.barrier()
-
-    if local_rank != 0:
-        train_dataset, test_dataset = prepare_datasets(
-            datasets,
-            seed=run_seed,
-            sample_size=sft_args.sample_size,
-            filter_by_id=sft_args.filter_by_id,
-            skip_eval=sft_args.skip_eval,
-        )
+    train_dataset, test_dataset = prepare_datasets(
+        datasets,
+        seed=run_seed,
+        sample_size=sft_args.sample_size,
+        filter_by_id=sft_args.filter_by_id,
+        skip_eval=sft_args.skip_eval,
+    )
 
     # train_stats, _ = get_dataset_stats(train_dataset, tokenizer, "Train")
     # test_stats = {}
@@ -691,27 +676,14 @@ def main():
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
-    if local_rank == 0:
-        trainer = SFTTrainer(
-            model=model,
-            args=sft_config,
-            train_dataset=train_dataset,
-            eval_dataset=test_dataset,  # None when skip_eval=True
-            callbacks=[WandbLoggingCallback(wandb_stats)]
-        )
-
-    dist.barrier()
-
-    if local_rank != 0:
-        # Let the remainder of the workers load from HF Cache
-        trainer = SFTTrainer(
-            model=model,
-            args=sft_config,
-            train_dataset=train_dataset,
-            eval_dataset=test_dataset,  # None when skip_eval=True
-            callbacks=[WandbLoggingCallback(wandb_stats)],
-            # expert_idx=sft_args.train_expert_idx,
-        )
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,  # None when skip_eval=True
+        callbacks=[WandbLoggingCallback(wandb_stats)],
+        # expert_idx=sft_args.train_expert_idx,
+    )
 
     # dataset = trainer.train_dataset
     # print(dataset[0])
