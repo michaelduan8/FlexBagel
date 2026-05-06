@@ -5,8 +5,6 @@ import pathlib
 import random
 import sys
 import torch
-import torch.distributed as dist
-#dist.init_process_group(backend="nccl")
 
 import wandb
 import json
@@ -762,52 +760,13 @@ def main():
     # ------------------------------------------------------------------
     # Dataset preparation
     # ------------------------------------------------------------------
-    local_rank = sft_config.local_rank
-    if local_rank == 0:
-        train_dataset, test_dataset = prepare_datasets(
-            datasets,
-            seed=run_seed,
-            sample_size=sft_args.sample_size,
-            filter_by_id=sft_args.filter_by_id,
-            skip_eval=sft_args.skip_eval,
-        )
-
-    dist.barrier()
-
-    if local_rank != 0:
-        train_dataset, test_dataset = prepare_datasets(
-            datasets,
-            seed=run_seed,
-            sample_size=sft_args.sample_size,
-            filter_by_id=sft_args.filter_by_id,
-            skip_eval=sft_args.skip_eval,
-        )
-
-    # train_stats, _ = get_dataset_stats(train_dataset, tokenizer, "Train")
-    # test_stats = {}
-    # if test_dataset is not None:
-    #     test_stats, _ = get_dataset_stats(test_dataset, tokenizer, "Test")
-
-    # Sample some examples to log to wandb
-    # NUM_EXAMPLES_TO_LOG = 5
-    # train_examples_to_log = train_dataset.shuffle(seed=run_seed).select(range(NUM_EXAMPLES_TO_LOG))
-    # test_examples_to_log = (
-    #     test_dataset.shuffle(seed=run_seed).select(range(NUM_EXAMPLES_TO_LOG))
-    #     if test_dataset is not None else None
-    # )
-
-    # ------------------------------------------------------------------
-    # SFTConfig
-    # ------------------------------------------------------------------
-    # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # lora_suffix = "_lora" if sft_args.use_lora else ""
-    # router_suffix = "_router" if sft_args.router_tuning_only else ""
-    # expert_suffix = f"_expert{sft_args.train_expert_idx}" if sft_args.train_expert_idx is not None else ""
-    # run_output_dir = os.path.join(
-    #     run_output_dir,
-    #     f"{run_id}{lora_suffix}{router_suffix}{expert_suffix}_{model_name.replace('/', '_')}_{timestamp}"
-    # )
-    # run_name = f"{run_id}{lora_suffix}{router_suffix}{expert_suffix}_{timestamp}"
+    train_dataset, test_dataset = prepare_datasets(
+        datasets,
+        seed=run_seed,
+        sample_size=sft_args.sample_size,
+        filter_by_id=sft_args.filter_by_id,
+        skip_eval=sft_args.skip_eval,
+    )
 
     checkpoint_path = paths["checkpoints"]
     checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -906,29 +865,14 @@ def main():
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
-    if local_rank == 0:
-        trainer = SFTTrainer(
-            model=model,
-            args=sft_config,
-            train_dataset=train_dataset,
-            eval_dataset=test_dataset,  # None when skip_eval=True
-            data_collator=data_collator,
-            callbacks=[WandbLoggingCallback(wandb_stats)]
-        )
-
-    dist.barrier()
-
-    if local_rank != 0:
-        # Let the remainder of the workers load from HF Cache
-        trainer = SFTTrainer(
-            model=model,
-            args=sft_config,
-            train_dataset=train_dataset,
-            eval_dataset=test_dataset,  # None when skip_eval=True
-            data_collator=data_collator,
-            callbacks=[WandbLoggingCallback(wandb_stats)],
-            # expert_idx=sft_args.train_expert_idx,
-        )
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_config,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,  # None when skip_eval=True
+        data_collator=data_collator,
+        callbacks=[WandbLoggingCallback(wandb_stats)]
+    )
 
     # dataset = trainer.train_dataset
     # print(dataset[0])
