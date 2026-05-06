@@ -7,7 +7,7 @@ import subprocess
 LOCAL_FLEXBAGEL = Path(__file__).parent.parent.parent / "FlexBagel"
 
 COMMAND = """
-cd /FlexBagel && PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=4 train/mm_tune_mt2.py \
+cd /FlexBagel && PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=4 train/mm_tune_mt.py \
     --run_id "quilt_qwen2_5-3b-vl-test" \
     --model Qwen/Qwen2.5-VL-3B-Instruct \
     --datasets /mnt/quilt/train.jsonl \
