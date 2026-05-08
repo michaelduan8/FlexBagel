@@ -3,6 +3,8 @@ import numpy as np
 import os
 import pathlib
 import random
+import re
+import shutil
 import sys
 import torch
 
@@ -15,7 +17,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image as PILImage
-from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback
+from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor
 from trl import SFTTrainer, SFTConfig
 
 @dataclass
@@ -25,6 +27,18 @@ class SFTArgs:
     datasets: list[str] = field(metadata={"help": "Dataset(s) to use for training"})
     run_seed: int = field(default=2025, metadata={"help": "Random seed for training"})
     run_output_dir: str = field(default="./checkpoints", metadata={"help": "Directory to save training runs"})
+    auto_resume: bool = field(
+        default=True,
+        metadata={"help": "Automatically resume from the latest checkpoint in run_output_dir/run_id if it exists."}
+    )
+    resume_checkpoint_path: str = field(
+        default=None,
+        metadata={"help": "Explicit checkpoint path to resume from. Overrides auto_resume."}
+    )
+    delete_intermediate_checkpoints: bool = field(
+        default=True,
+        metadata={"help": "Delete checkpoint-* directories after successful training completion."}
+    )
     sample_size: list[int] = field(
         default=None,
         metadata={"help": "Sampling control. Pass one value for global sampling after datasets are merged "
@@ -67,6 +81,72 @@ class SFTArgs:
         metadata={"help": "Target modules for LoRA. If None, uses default for the model architecture."}
     )
     merge_and_save: bool = field(default=False, metadata={"help": "Merge LoRA weights into base model and save full model"})
+
+
+def measure_vlm_lengths(dataset, processor, n=200):
+    lengths = []
+    text_only_lengths = []
+    image_token_estimates = []
+
+    n = min(n, len(dataset))
+
+    for ex in dataset.select(range(n)):
+        messages = ex["prompt"] + ex["completion"]
+
+        # Text with image placeholders
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+        # Load PIL images from dataset
+        images = ex["images"]
+
+        # Full VLM processing: text + images
+        inputs = processor(
+            text=text,
+            images=images,
+            return_tensors="pt",
+        )
+
+        full_len = inputs["input_ids"].shape[-1]
+
+        # Text-only length, for comparison
+        text_inputs = processor.tokenizer(
+            text,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        text_len = text_inputs["input_ids"].shape[-1]
+
+        lengths.append(full_len)
+        text_only_lengths.append(text_len)
+        image_token_estimates.append(full_len - text_len)
+
+    lengths = np.array(lengths)
+    text_only_lengths = np.array(text_only_lengths)
+    image_token_estimates = np.array(image_token_estimates)
+
+    print("=== Full VLM sequence length: text + image tokens ===")
+    print(f"mean: {lengths.mean():.1f}")
+    print(f"p50:  {np.percentile(lengths, 50):.1f}")
+    print(f"p90:  {np.percentile(lengths, 90):.1f}")
+    print(f"p95:  {np.percentile(lengths, 95):.1f}")
+    print(f"p99:  {np.percentile(lengths, 99):.1f}")
+    print(f"max:  {lengths.max()}")
+
+    print("\n=== Text-only length ===")
+    print(f"mean: {text_only_lengths.mean():.1f}")
+    print(f"p95:  {np.percentile(text_only_lengths, 95):.1f}")
+    print(f"max:  {text_only_lengths.max()}")
+
+    print("\n=== Estimated image-token contribution ===")
+    print(f"mean: {image_token_estimates.mean():.1f}")
+    print(f"p50:  {np.percentile(image_token_estimates, 50):.1f}")
+    print(f"p90:  {np.percentile(image_token_estimates, 90):.1f}")
+    print(f"p95:  {np.percentile(image_token_estimates, 95):.1f}")
+    print(f"max:  {image_token_estimates.max()}")
 
 
 def register_local_architectures():
@@ -475,6 +555,64 @@ def get_structured_paths(args):
     }
 
 
+def _checkpoint_step(checkpoint_dir: pathlib.Path) -> int:
+    """Return the numeric step from a checkpoint-* directory name, or -1 if invalid."""
+    match = re.fullmatch(r"checkpoint-(\d+)", checkpoint_dir.name)
+    return int(match.group(1)) if match else -1
+
+
+def get_latest_checkpoint(checkpoint_path: pathlib.Path) -> str | None:
+    """Find the latest Hugging Face Trainer checkpoint under checkpoint_path."""
+    if not checkpoint_path.exists():
+        return None
+
+    checkpoints = [
+        path for path in checkpoint_path.iterdir()
+        if path.is_dir() and _checkpoint_step(path) >= 0
+    ]
+    if not checkpoints:
+        return None
+
+    latest = max(checkpoints, key=_checkpoint_step)
+    return str(latest)
+
+
+def resolve_resume_checkpoint(sft_args, checkpoint_path: pathlib.Path) -> str | None:
+    """Resolve the checkpoint path used by trainer.train(resume_from_checkpoint=...)."""
+    if sft_args.resume_checkpoint_path is not None:
+        resume_path = pathlib.Path(sft_args.resume_checkpoint_path).expanduser()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"resume_checkpoint_path does not exist: {resume_path}")
+        print(f"Resuming from explicit checkpoint: {resume_path}")
+        return str(resume_path)
+
+    if sft_args.auto_resume:
+        latest_checkpoint = get_latest_checkpoint(checkpoint_path)
+        if latest_checkpoint is not None:
+            print(f"Auto-resume enabled. Resuming from latest checkpoint: {latest_checkpoint}")
+            return latest_checkpoint
+        print(f"Auto-resume enabled, but no checkpoint-* directory found in {checkpoint_path}. Starting from scratch.")
+
+    return None
+
+
+def delete_intermediate_checkpoints(checkpoint_path: pathlib.Path, final_output_dir: str):
+    """Delete checkpoint-* directories after training has completed successfully."""
+    final_path = pathlib.Path(final_output_dir).resolve()
+    deleted = []
+
+    for path in checkpoint_path.iterdir():
+        if not path.is_dir() or _checkpoint_step(path) < 0:
+            continue
+        if path.resolve() == final_path:
+            continue
+        print(f"Deleting intermediate checkpoint: {path}")
+        shutil.rmtree(path)
+        deleted.append(str(path))
+
+    print(f"Deleted {len(deleted)} intermediate checkpoint(s).")
+
+
 def main():
     parser = HfArgumentParser([SFTConfig, SFTArgs])
     sft_config, sft_args = parser.parse_args_into_dataclasses()
@@ -506,6 +644,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+
+    # train_dataset, test_dataset = prepare_datasets(
+    #     datasets,
+    #     seed=run_seed,
+    #     sample_size=sft_args.sample_size,
+    #     filter_by_id=sft_args.filter_by_id,
+    #     skip_eval=sft_args.skip_eval,
+    # )
+
+    # measure_vlm_lengths(train_dataset, processor, n=500)
+    # assert False
 
     use_bf16 = torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
@@ -623,6 +773,7 @@ def main():
 
     checkpoint_path = paths["checkpoints"]
     checkpoint_path.mkdir(parents=True, exist_ok=True)
+    resume_checkpoint = resolve_resume_checkpoint(sft_args, checkpoint_path)
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
@@ -682,7 +833,6 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=test_dataset,  # None when skip_eval=True
         callbacks=[WandbLoggingCallback(wandb_stats)],
-        # expert_idx=sft_args.train_expert_idx,
     )
 
     # dataset = trainer.train_dataset
@@ -693,7 +843,7 @@ def main():
         trainer.evaluate()  # Evaluate once before training
 
     print("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     final_output_dir = os.path.join(str(checkpoint_path), "final")
 
     if sft_args.use_lora and sft_args.merge_and_save:
@@ -712,6 +862,9 @@ def main():
 
     if not sft_args.skip_eval:
         trainer.evaluate()  # Final evaluation after training
+
+    if sft_args.delete_intermediate_checkpoints:
+        delete_intermediate_checkpoints(checkpoint_path, final_output_dir)
 
     wandb.finish()
     

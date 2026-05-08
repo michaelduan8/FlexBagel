@@ -73,7 +73,7 @@ class SFTArgs:
         default=True,
         metadata={"help": "Automatically resume from the latest checkpoint in run_output_dir/run_id if it exists."}
     )
-    resume_from_checkpoint: str = field(
+    resume_checkpoint_path: str = field(
         default=None,
         metadata={"help": "Explicit checkpoint path to resume from. Overrides auto_resume."}
     )
@@ -773,8 +773,8 @@ def main():
 
     resume_checkpoint = None
 
-    if sft_args.resume_from_checkpoint is not None:
-        resume_checkpoint = sft_args.resume_from_checkpoint
+    if sft_args.resume_checkpoint_path is not None:
+        resume_checkpoint = sft_args.resume_checkpoint_path
     elif sft_args.auto_resume:
         resume_checkpoint = get_last_checkpoint(str(checkpoint_path))
 
