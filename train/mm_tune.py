@@ -795,6 +795,10 @@ def main():
     sft_config.seed = run_seed
     sft_config.data_seed = run_seed
 
+    # VLM-specific safety
+    sft_config.remove_unused_columns = False
+    sft_config.max_length = None
+
     if sft_args.skip_eval:
         sft_config.eval_strategy = "no"
         sft_config.do_eval = False
@@ -831,10 +835,23 @@ def main():
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,  # None when skip_eval=True
+        eval_dataset=test_dataset,
+        processing_class=processor,
         callbacks=[WandbLoggingCallback(wandb_stats)],
     )
 
+    batch = next(iter(trainer.get_train_dataloader()))
+
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            print(k, tuple(v.shape), v.dtype)
+        else:
+            print(k, type(v))
+
+    assert batch["input_ids"].ndim == 2, batch["input_ids"].shape
+    assert batch["attention_mask"].ndim == 2, batch["attention_mask"].shape
+    assert "pixel_values" in batch, batch.keys()
+    assert "image_grid_thw" in batch, batch.keys()
     # dataset = trainer.train_dataset
     # print(dataset[0])
     # quit()
