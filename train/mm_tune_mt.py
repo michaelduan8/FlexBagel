@@ -81,35 +81,209 @@ class SFTArgs:
         default=True,
         metadata={"help": "Delete checkpoint-* directories after successful training completion."}
     )
+    debug_token_length_stats: bool = field(
+        default=True,
+        metadata={"help": "Print token length distribution, including image tokens, before loading the model."}
+    )
+    debug_token_length_sample_size: int = field(
+        default=2000,
+        metadata={"help": "Number of examples to sample for token length stats. Use -1 for full train dataset."}
+    )
+    debug_token_length_show_longest: int = field(
+        default=10,
+        metadata={"help": "Show the longest N examples by processor token length."}
+    )
 
 
-def delete_intermediate_checkpoints(checkpoint_path, keep_final=True):
+def print_token_length_distribution(
+    dataset,
+    processor,
+    tokenizer,
+    seed=2025,
+    sample_size=2000,
+    show_longest=10,
+):
     """
-    Delete Hugging Face intermediate checkpoint-* directories after training completes.
+    Count token lengths after processor expansion, including image tokens.
 
-    Keeps:
-      - final/ directory
-      - non-checkpoint files in checkpoint_path
-
-    Deletes:
-      - checkpoint-100/
-      - checkpoint-200/
-      - etc.
+    This does NOT load the model and does NOT require GPU.
+    It uses processor(text=..., images=..., truncation=False), so the reported
+    length should match what the model will actually receive before truncation.
     """
-    checkpoint_path = pathlib.Path(checkpoint_path)
 
-    if not checkpoint_path.exists():
-        print(f"No checkpoint path found: {checkpoint_path}")
+    tmp_collator = FullConversationCompletionOnlyCollator(
+        processor=processor,
+        tokenizer=tokenizer,
+        max_length=None,  # important: no truncation for stats
+    )
+
+    n_total = len(dataset)
+    if sample_size is None or sample_size < 0 or sample_size >= n_total:
+        indices = list(range(n_total))
+        print(f"[length-debug] Measuring all {n_total} examples.")
+    else:
+        rng = random.Random(seed)
+        indices = rng.sample(range(n_total), sample_size)
+        print(f"[length-debug] Measuring {sample_size} / {n_total} sampled examples.")
+
+    lengths = []
+    text_only_lengths = []
+    num_images_list = []
+    records = []
+
+    failed = 0
+
+    for rank, idx in enumerate(indices):
+        example = dataset[idx]
+        messages = example["messages"]
+        images = example.get("images", [])
+
+        text = tmp_collator._render(messages)
+        num_images = len(images) if images is not None else 0
+
+        try:
+            processor_kwargs = dict(
+                text=[text],
+                padding=False,
+                truncation=False,
+                return_tensors=None,
+            )
+
+            if num_images > 0:
+                processor_kwargs["images"] = [images]
+
+            encoded = processor(**processor_kwargs)
+
+            input_ids = encoded["input_ids"]
+
+            # Depending on processor/tokenizer, this may be list[int] or list[list[int]]
+            if len(input_ids) > 0 and isinstance(input_ids[0], list):
+                total_len = len(input_ids[0])
+            else:
+                total_len = len(input_ids)
+
+            text_only_ids = tokenizer(
+                text,
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+            text_only_len = len(text_only_ids)
+
+            lengths.append(total_len)
+            text_only_lengths.append(text_only_len)
+            num_images_list.append(num_images)
+
+            records.append({
+                "dataset_idx": idx,
+                "prompt_id": example.get("prompt_id", "<missing>"),
+                "total_tokens_with_images": total_len,
+                "text_only_tokens": text_only_len,
+                "estimated_image_tokens": total_len - text_only_len,
+                "num_images": num_images,
+                "num_messages": len(messages),
+            })
+
+        except Exception as e:
+            failed += 1
+            print(
+                f"[length-debug][WARNING] Failed on dataset_idx={idx}, "
+                f"prompt_id={example.get('prompt_id', '<missing>')}: {repr(e)}"
+            )
+
+    if not lengths:
+        print("[length-debug][ERROR] No examples were successfully measured.")
         return
 
-    deleted = 0
-    for child in checkpoint_path.iterdir():
-        if child.is_dir() and child.name.startswith("checkpoint-"):
-            print(f"Deleting intermediate checkpoint: {child}")
-            shutil.rmtree(child)
-            deleted += 1
+    arr = np.array(lengths)
+    text_arr = np.array(text_only_lengths)
+    image_arr = arr - text_arr
+    num_images_arr = np.array(num_images_list)
 
-    print(f"Deleted {deleted} intermediate checkpoint directories.")
+    percentiles = [50, 75, 90, 95, 97, 98, 99, 99.5, 99.9, 100]
+
+    print("\n" + "=" * 100)
+    print("[length-debug] Token length distribution BEFORE model loading")
+    print("=" * 100)
+    print(f"[length-debug] successful examples: {len(lengths)}")
+    print(f"[length-debug] failed examples: {failed}")
+    print(f"[length-debug] dataset size: {n_total}")
+    print(f"[length-debug] measured size: {len(indices)}")
+
+    print("\n[length-debug] Total tokens, including image tokens")
+    print(f"min:  {arr.min()}")
+    print(f"mean: {arr.mean():.2f}")
+    print(f"max:  {arr.max()}")
+
+    for p in percentiles:
+        print(f"p{p:<5}: {np.percentile(arr, p):.1f}")
+
+    print("\n[length-debug] Text-only token length")
+    print(f"min:  {text_arr.min()}")
+    print(f"mean: {text_arr.mean():.2f}")
+    print(f"max:  {text_arr.max()}")
+
+    for p in percentiles:
+        print(f"p{p:<5}: {np.percentile(text_arr, p):.1f}")
+
+    print("\n[length-debug] Estimated image-token contribution")
+    print("This is total processor length minus tokenizer-only text length.")
+    print(f"min:  {image_arr.min()}")
+    print(f"mean: {image_arr.mean():.2f}")
+    print(f"max:  {image_arr.max()}")
+
+    for p in percentiles:
+        print(f"p{p:<5}: {np.percentile(image_arr, p):.1f}")
+
+    print("\n[length-debug] Number of images per example")
+    print(f"min:  {num_images_arr.min()}")
+    print(f"mean: {num_images_arr.mean():.2f}")
+    print(f"max:  {num_images_arr.max()}")
+
+    unique_counts, count_freqs = np.unique(num_images_arr, return_counts=True)
+    for image_count, freq in zip(unique_counts, count_freqs):
+        print(f"num_images={image_count}: {freq} examples")
+
+    print("\n[length-debug] Longest examples")
+    records = sorted(
+        records,
+        key=lambda x: x["total_tokens_with_images"],
+        reverse=True,
+    )
+
+    for r in records[:show_longest]:
+        print(
+            f"idx={r['dataset_idx']} | "
+            f"prompt_id={r['prompt_id']} | "
+            f"total={r['total_tokens_with_images']} | "
+            f"text_only={r['text_only_tokens']} | "
+            f"image_est={r['estimated_image_tokens']} | "
+            f"num_images={r['num_images']} | "
+            f"num_messages={r['num_messages']}"
+        )
+
+    print("\n[length-debug] Suggested max_length candidates")
+    for p in [90, 95, 98, 99]:
+        value = int(np.ceil(np.percentile(arr, p)))
+        print(f"cover p{p}: max_length ≈ {value}")
+
+    print("=" * 100 + "\n")
+
+
+def delete_intermediate_checkpoints(checkpoint_path: pathlib.Path, final_output_dir: str):
+    """Delete checkpoint-* directories after training has completed successfully."""
+    final_path = pathlib.Path(final_output_dir).resolve()
+    deleted = []
+
+    for path in checkpoint_path.iterdir():
+        if not path.is_dir() or _checkpoint_step(path) < 0:
+            continue
+        if path.resolve() == final_path:
+            continue
+        print(f"Deleting intermediate checkpoint: {path}")
+        shutil.rmtree(path)
+        deleted.append(str(path))
+
+    print(f"Deleted {len(deleted)} intermediate checkpoint(s).")
 
 
 def register_local_architectures():
@@ -680,6 +854,24 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    train_dataset, test_dataset = prepare_datasets(
+        datasets,
+        seed=run_seed,
+        sample_size=sft_args.sample_size,
+        filter_by_id=sft_args.filter_by_id,
+        skip_eval=sft_args.skip_eval,
+    )
+    if sft_args.debug_token_length_stats:
+        print_token_length_distribution(
+            dataset=train_dataset,
+            processor=processor,
+            tokenizer=tokenizer,
+            seed=run_seed,
+            sample_size=sft_args.debug_token_length_sample_size,
+            show_longest=sft_args.debug_token_length_show_longest,
+        )
+    assert False
+
     use_bf16 = torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
     model = AutoModelForImageTextToText.from_pretrained(
@@ -885,27 +1077,33 @@ def main():
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     final_output_dir = os.path.join(str(checkpoint_path), "final")
 
-    if sft_args.use_lora and sft_args.merge_and_save:
-        print("Merging LoRA weights into base model...")
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(final_output_dir)
+    # Wait for all ranks to finish training
+    trainer.accelerator.wait_for_everyone()
+
+    # Save only from rank 0 / main process
+    if trainer.is_world_process_zero():
+        if sft_args.use_lora and sft_args.merge_and_save:
+            print("Merging LoRA weights into base model...")
+            unwrapped_model = trainer.accelerator.unwrap_model(trainer.model)
+            merged_model = unwrapped_model.merge_and_unload()
+            merged_model.save_pretrained(final_output_dir, safe_serialization=True)
+        else:
+            trainer.save_model(output_dir=final_output_dir)
+
         tokenizer.save_pretrained(final_output_dir)
         processor.save_pretrained(final_output_dir)
-        print(f"Merged model saved to {final_output_dir}")
-    else:
-        trainer.save_model(output_dir=final_output_dir)
-        tokenizer.save_pretrained(final_output_dir)
-        processor.save_pretrained(final_output_dir)
-        if sft_args.use_lora:
-            print(f"LoRA adapter saved to {final_output_dir}")
+
+    # Wait until final save is completely done
+    trainer.accelerator.wait_for_everyone()
 
     if not sft_args.skip_eval:
         trainer.evaluate()  # Final evaluation after training
 
-    if sft_args.delete_intermediate_checkpoints:
-        if local_rank in (-1, 0):
-            print("Training completed successfully. Deleting intermediate checkpoints...")
-            delete_intermediate_checkpoints(checkpoint_path)
+    if sft_args.delete_intermediate_checkpoints and trainer.is_world_process_zero():
+        print("Training completed successfully. Deleting intermediate checkpoints...")
+        delete_intermediate_checkpoints(checkpoint_path)
+
+    trainer.accelerator.wait_for_everyone()
 
     wandb.finish()
     
