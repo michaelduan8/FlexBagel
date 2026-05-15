@@ -49,6 +49,7 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
     images = list(images)
     assert len(images) > 0, f"No images found for row with id {id} in raw data directory {raw_data_dir}."
 
+    row["orig_images"] = [row["image"]]
     row["images"] = images
 
     patient_data = f"Sex: {row['PatientSex']}\n\nAge: {row['PatientAge']}\n\nDescription: {row['StudyDescription']}\n\nIndication: {row['Indication']}"

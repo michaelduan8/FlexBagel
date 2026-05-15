@@ -42,6 +42,7 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
     id = row["id"]
     image = os.path.join(raw_data_dir, row["image"])
     
+    row["orig_images"] = [row["image"]]
     row["images"] = [image]
 
     conversation = row["conversations"]

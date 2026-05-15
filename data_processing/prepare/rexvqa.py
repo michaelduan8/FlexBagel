@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import pandas as pd
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +16,7 @@ def normalize_image_path(image: str, raw_data_dir: Path) -> str:
     return normalized_image
 
 
-def row_has_existing_image(row: pd.Series, raw_data_dir: Path) -> bool:
+def row_has_existing_image(row: dict[str, Any], raw_data_dir: Path) -> bool:
     for img_path in row["ImagePath"]:
         if not os.path.exists(normalize_image_path(img_path, raw_data_dir)):
             return False
@@ -32,10 +34,16 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Local directory that contains raw data assets.",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Number of worker processes to use for filtering and mapping.",
+    )
     return parser.parse_args()
 
 
-def map_row(row: pd.Series, idx: int, raw_data_dir: Path) -> dict[str, Any]:
+def map_row(row: dict[str, Any], raw_data_dir: Path) -> dict[str, Any]:
     """
     Per row, we remap the conversation and image metadata
     """
@@ -63,6 +71,7 @@ def map_row(row: pd.Series, idx: int, raw_data_dir: Path) -> dict[str, Any]:
 
     return {
         "id": row["id"],
+        "orig_images": row["ImagePath"],
         "images": normalized_images,
         "conversation": normalized_conversation,
     }
@@ -74,24 +83,41 @@ def main() -> None:
     input = Path(args.input)
     output = Path(args.output)
     raw_data_dir = Path(args.raw_data_dir)
+    num_workers = max(1, args.num_workers)
 
     df = pd.read_json(input, orient="index")
     df = df.reset_index().rename(columns={"index": "id"})
+    rows = df.to_dict(orient="records")
     total = len(df)
     print(f"Loaded {total} rows from {input}.")
 
     # Filter rows where all images exist
-    mask = []
-    for _, row in tqdm(df.iterrows(), total=total, desc="Filtering"):
-        mask.append(row_has_existing_image(row, raw_data_dir))
+    filter_fn = partial(row_has_existing_image, raw_data_dir=raw_data_dir)
+    with mp.Pool(processes=num_workers) as pool:
+        mask = list(
+            tqdm(
+                pool.imap(filter_fn, rows, chunksize=64),
+                total=total,
+                desc="Filtering",
+            )
+        )
 
-    df = df[mask].reset_index(drop=True)
-    print(f"Filter complete: {len(df)} kept, {total - len(df)} skipped.\n")
+    filtered_rows = [row for row, keep in zip(rows, mask) if keep]
+    print(
+        f"Filter complete: {len(filtered_rows)} kept, "
+        f"{total - len(filtered_rows)} skipped.\n"
+    )
 
     # Map each row to the output schema
-    records = []
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Mapping"):
-        records.append(map_row(row, idx, raw_data_dir))
+    map_fn = partial(map_row, raw_data_dir=raw_data_dir)
+    with mp.Pool(processes=num_workers) as pool:
+        records = list(
+            tqdm(
+                pool.imap(map_fn, filtered_rows, chunksize=64),
+                total=len(filtered_rows),
+                desc="Mapping",
+            )
+        )
 
     result_df = pd.DataFrame(records)
 
