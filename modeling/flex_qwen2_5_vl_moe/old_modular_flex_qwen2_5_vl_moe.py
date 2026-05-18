@@ -18,36 +18,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub.dataclasses import strict
 
-from transformers import initialization as init
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from transformers.utils.output_capturing import OutputRecorder
-from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 from transformers.models.qwen2_moe.modeling_qwen2_moe import (
-    Qwen2MoeDecoderLayer,
-    Qwen2MoePreTrainedModel,
-    Qwen2MoeRMSNorm,
-    Qwen2MoeSparseMoeBlock,
     load_balancing_loss_func,
 )
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig, Qwen2_5_VLTextConfig
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLPreTrainedModel,
+    Qwen2_5_VisionPatchEmbed,
+    Qwen2_5_VisionRotaryEmbedding,
+    Qwen2_5_VLVisionAttention,
+    Qwen2_5_VLPatchMerger,
+    Qwen2_5_VisionTransformerPretrainedModel,
+    Qwen2_5_VLAttention,
+    Qwen2_5_VLTextModel,
+    Qwen2_5_VLModel,
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLForConditionalGeneration,
     Qwen2_5_VLModelOutputWithPast,
-    Qwen2_5_VLAttention,
-    Qwen2_5_VLTextModel,
-    Qwen2_5_VLVisionAttention,
-    Qwen2_5_VLVisionBlock,
-    Qwen2_5_VisionTransformerPretrainedModel,
-    Qwen2_5_VisionRotaryEmbedding,
 )
 
+from typing import Optional, Union
 
 logger = logging.get_logger(__name__)
 
@@ -102,29 +102,34 @@ class Flex_Qwen2_5_VLMoeTextConfig(Qwen2_5_VLTextConfig):
     num_attention_heads: int = 16
     num_key_value_heads: int = 16
     max_position_embeddings: int = 32768
-    moe_intermediate_size: int = 1408
-    num_experts_per_tok: int = 4
-    num_experts: int = 60
-    head_dim: int | None = None
-    tie_word_embeddings: bool = True
 
+    # MoE config
     decoder_sparse_step: int = 1
     moe_intermediate_size: int = 1408
     shared_expert_intermediate_size: int = 5632
-    # TODO: finish populating
-    num_experts_per_tok = num_experts_per_tok
-    num_experts = num_experts
-    norm_topk_prob = norm_topk_prob
-    output_router_logits = output_router_logits
-    router_aux_loss_coef = router_aux_loss_coef
-    mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
-    qkv_bias = qkv_bias
+    num_experts_per_tok: int = 4
+    num_experts: int = 60
+    norm_topk_prob: bool = False
+    output_router_logits: bool = False
+    router_aux_loss_coef: float = 0.001
+    mlp_only_layers: list = []
+    qkv_bias: bool = True
 
 
 @strict
 class Flex_Qwen2_5_VLMoeVisionConfig(Qwen2_5_VLVisionConfig):
     model_type = "flex_qwen2_5_vl_moe_vision"
-    pass
+
+    # TODO: consider if parallelism plan needed
+
+    # MoE config
+    decoder_sparse_step: int = 1
+    moe_intermediate_size: int = 1408
+    shared_expert_intermediate_size: int = 5632
+    num_experts_per_tok: int = 4
+    num_experts: int = 60
+    norm_topk_prob: bool = False
+    mlp_only_layers: list = []
 
     
 @strict
@@ -147,12 +152,43 @@ class Flex_Qwen2_5_VLMoeConfig(Qwen2_5_VLConfig):
     pass
 
 
-class Flex_Qwen2_5_VLMoeRMSNorm(Qwen2RMSNorm):
-    pass
+class Flex_Qwen2_5_VLMoeRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        Flex_Qwen2_5_VLMoeRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class Flex_Qwen2_5_VLMoeSparseMoeBlock(Qwen2MoeSparseMoeBlock):
-    def __init__(self, config):
+class Flex_Qwen2_5_VLMoeMLP(nn.Module):
+    def __init__(self, config, intermediate_size=None, bias=False):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_state):
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+
+
+class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
+    def __init__(self, config, bias=False):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
@@ -161,10 +197,10 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(Qwen2MoeSparseMoeBlock):
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
-            [Qwen2MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
+            [Flex_Qwen2_5_VLMoeMLP(config, bias=bias) for _ in range(self.num_experts)]
         )
 
-        self.shared_expert = Qwen2MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.shared_expert = Flex_Qwen2_5_VLMoeMLP(config, intermediate_size=config.shared_expert_intermediate_size, bias=bias)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -214,16 +250,13 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(Qwen2MoeSparseMoeBlock):
         return final_hidden_states, router_logits
 
 
-class Flex_Qwen2_5_VLMoeMLP(Qwen2MLP):
-    pass
-
-
 class Flex_Qwen2_5_VLMoeAttention(Qwen2_5_VLAttention):
     pass
 
 
 class Flex_Qwen2_5_VLMoeDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Flex_Qwen2_5_VLMoeTextConfig, layer_idx: int):
+        # Built from the qwen2.5 VL decoder layer with MoE layer replacement
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -324,47 +357,71 @@ class Flex_Qwen2_5_VLMoeDecoderLayer(GradientCheckpointingLayer):
         return outputs
 
 
-class Qwen3VLMoePreTrainedModel(Qwen3MoePreTrainedModel):
-    config: Qwen3VLMoeConfig
+class Flex_Qwen2_5_VLMoePreTrainedModel(Qwen2_5_VLPreTrainedModel):
+    config: Flex_Qwen2_5_VLMoeConfig
     input_modalities = ("text", "image", "video")
-    _no_split_modules = ["Qwen3VLMoeTextDecoderLayer", "Qwen3VLMoeVisionBlock"]
+    _no_split_modules = ["Flex_Qwen2_5_VLMoeDecoderLayer", "Flex_Qwen2_5_VLMoeVisionBlock"]
 
-    @torch.no_grad()
-    def _init_weights(self, module):
-        """Initialize the weights."""
-        PreTrainedModel._init_weights(self, module)
-        if hasattr(self.config, "initializer_range"):
-            std = self.config.initializer_range
+
+class Flex_Qwen2_5_VLMoeVisionPatchEmbed(Qwen2_5_VisionPatchEmbed):
+    pass
+
+
+class Flex_Qwen2_5_VLMoeVisionRotaryEmbedding(Qwen2_5_VisionRotaryEmbedding):
+    pass
+
+
+class Flex_Qwen2_5_VLMoeVisionAttention(Qwen2_5_VLVisionAttention):
+    pass
+
+
+class Flex_Qwen2_5_VLMoeVisionBlock(GradientCheckpointingLayer):
+    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+        super().__init__()
+        self.norm1 = Flex_Qwen2_5_VLMoeRMSNorm(config.hidden_size, eps=1e-6)
+        self.norm2 = Flex_Qwen2_5_VLMoeRMSNorm(config.hidden_size, eps=1e-6)
+        self.attn = Flex_Qwen2_5_VLMoeVisionAttention(config=config)
+
+        if config.num_experts > 0:
+            self.mlp = Flex_Qwen2_5_VLMoeSparseMoeBlock(config, True)
         else:
-            std = getattr(self.config.get_text_config(), "initializer_range", 0.02)
-        if isinstance(module, Qwen3VLMoeTextExperts):
-            init.normal_(module.gate_up_proj, mean=0.0, std=std)
-            init.normal_(module.down_proj, mean=0.0, std=std)
-        elif isinstance(module, Qwen3VLMoeTextTopKRouter):
-            init.normal_(module.weight, mean=0.0, std=std)
-        elif isinstance(module, Qwen3VLMoeVisionRotaryEmbedding):
-            inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
-            init.copy_(module.inv_freq, inv_freq)
+            self.mlp = Flex_Qwen2_5_VLMoeMLP(config, bias=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+        residual = hidden_states
+
+        hidden_states = self.mlp(self.norm2(hidden_states))
+        if isinstance(hidden_states, tuple):
+            hidden_states, router_logits = hidden_states
+        else:
+            router_logits = None
+
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
-# class Qwen3VLMoeVisionRotaryEmbedding(Qwen3VLVisionRotaryEmbedding):
-#     pass
+class Flex_Qwen2_5_VLMoePatchMerger(Qwen2_5_VLPatchMerger):
+    pass
 
 
-# class Qwen3VLMoeVisionAttention(Qwen3VLVisionAttention):
-#     pass
+class Flex_Qwen2_5_VLMoeVisionModel(Qwen2_5_VisionTransformerPretrainedModel):
+    pass
 
-
-# class Qwen3VLMoeVisionBlock(Qwen3VLVisionBlock):
-#     pass
-
-
-class Qwen3VLMoeVisionModel(Qwen3VLVisionModel):
-    _can_record_outputs = {
-        "router_logits": OutputRecorder(Qwen3VLMoeTextTopKRouter, layer_name="mlp.gate", index=0),
-        "hidden_states": Qwen3VLMoeVisionBlock,
-        "attentions": Qwen3VLMoeVisionAttention,
-    }
 
 class Flex_Qwen2_5_VLMoeTextModel(Qwen2_5_VLTextModel):
     @auto_docstring
@@ -378,13 +435,17 @@ class Flex_Qwen2_5_VLMoeTextModel(Qwen2_5_VLTextModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[tuple, BaseModelOutputWithPast]:
+    ) -> Union[tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
@@ -462,6 +523,7 @@ class Flex_Qwen2_5_VLMoeTextModel(Qwen2_5_VLTextModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        all_router_logits = () if output_router_logits else None
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -473,6 +535,7 @@ class Flex_Qwen2_5_VLMoeTextModel(Qwen2_5_VLTextModel):
                 position_ids=text_position_ids,
                 past_key_value=past_key_values,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
@@ -484,6 +547,9 @@ class Flex_Qwen2_5_VLMoeTextModel(Qwen2_5_VLTextModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+            if output_router_logits and layer_outputs[-1] is not None:
+                all_router_logits += (layer_outputs[-1],)
+
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -492,130 +558,54 @@ class Flex_Qwen2_5_VLMoeTextModel(Qwen2_5_VLTextModel):
 
         if not return_dict:
             return tuple(
-                v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None
+                v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns, all_router_logits] if v is not None
             )
-        return BaseModelOutputWithPast(
+
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            router_logits=all_router_logits,
         )
 
 
-class Qwen3VLMoeTextModel(Qwen3VLTextModel):
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        use_cache: bool | None = None,
-        # args for deepstack
-        visual_pos_masks: torch.Tensor | None = None,
-        deepstack_visual_embeds: list[torch.Tensor] | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple | MoeModelOutputWithPast:
-        r"""
-        visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
-            The mask of the visual positions.
-        deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
-            The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
-            The feature is extracted from the different visual encoder layers, and fed to the decoder
-            hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
-        """
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        # torch.jit.trace() doesn't support cache objects in the output
-        if use_cache and past_key_values is None and not torch.jit.is_tracing():
-            past_key_values = DynamicCache(config=self.config)
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        # the hard coded `4` is for text, temporal, height and width.
-        if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
-        elif position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
-
-        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
-            position_ids = position_ids[1:]
-        else:
-            text_position_ids = None
-
-        attention_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
-        )
-
-        hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        # decoder layers
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=text_position_ids,
-                past_key_values=past_key_values,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-            hidden_states = layer_outputs
-
-            # add visual features to the hidden states of first several layers
-            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
-                )
-
-        hidden_states = self.norm(hidden_states)
-
-        return MoeModelOutputWithPast(  # only diff with Qwen3VLTextModel
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-        )
+class Flex_Qwen2_5_VLMoeModel(Qwen2_5_VLModel):
+    pass
 
 
-class Qwen3VLMoeModelOutputWithPast(Qwen3VLModelOutputWithPast):
+class Flex_Qwen2_5_VLMoeModelOutputWithPast(Qwen2_5_VLModelOutputWithPast):
     router_logits: tuple[torch.FloatTensor] | None = None
 
 
-class Qwen3VLMoeCausalLMOutputWithPast(Qwen3VLCausalLMOutputWithPast):
+class Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(Qwen2_5_VLCausalLMOutputWithPast):
     router_logits: tuple[torch.FloatTensor] | None = None
     aux_loss: torch.FloatTensor | None = None
 
 
-class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+class Flex_Qwen2_5_VLMoeForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
     @can_return_tuple
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen3VLMoeCausalLMOutputWithPast:
+    ) -> Union[tuple, Flex_Qwen2_5_VLMoeCausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -625,47 +615,40 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+            The rope index difference between sequence length and multimodal rope.
+        second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+            The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
 
         Example:
+
         ```python
         >>> from PIL import Image
-        >>> import httpx
-        >>> from io import BytesIO
-        >>> from transformers import AutoProcessor, Qwen3VLMoeForConditionalGeneration
+        >>> import requests
+        >>> from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-        >>> model = Qwen3VLMoeForConditionalGeneration.from_pretrained("Qwen/Qwen3-VL-30B-A3B-Instruct", dtype="auto", device_map="auto")
-        >>> processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-30B-A3B-Instruct")
+        >>> model = Qwen2_5_VLForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        >>> processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
 
         >>> messages = [
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image",
-                        "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-                    },
-                    {"type": "text", "text": "Describe this image in short."},
+                    {"type": "image"},
+                    {"type": "text", "text": "What is shown in this image?"},
                 ],
-            }
+            },
         ]
+        >>> url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> # Preparation for inference
-        >>> inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
-        )
-        >>> inputs = inputs.to(model.device)
+        >>> text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        >>> inputs = processor(text=[text], images=[image], vision_infos=[vision_infos])
 
         >>> # Generate
-        >>> generated_ids = model.generate(**inputs, max_new_tokens=128)
-        >>> generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        >>> processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "A woman in a plaid shirt sits on a sandy beach at sunset, smiling as she gives a high-five to a yellow Labrador Retriever wearing a harness. The ocean waves roll in the background."
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "The image shows a street scene with a red stop sign in the foreground. In the background, there is a large red gate with Chinese characters ..."
         ```"""
 
         outputs = self.model(
@@ -674,11 +657,16 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
-            mm_token_type_ids=mm_token_type_ids,
+            second_per_grid_ts=second_per_grid_ts,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
             **kwargs,
         )
 
@@ -692,8 +680,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
+        
         aux_loss = None
-        if kwargs.get("output_router_logits", False):
+        if kwargs.get("output_router_logits", self.config.text_config.output_router_logits) and outputs.router_logits is not None:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
@@ -705,25 +694,26 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     loss.device
                 )  # make sure to reside in the same device
 
-        return Qwen3VLMoeCausalLMOutputWithPast(
+
+        return Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
             router_logits=outputs.router_logits,
+            rope_deltas=outputs.rope_deltas,
         )
 
 
 __all__ = [
-    "Qwen3VLMoeConfig",
-    "Qwen3VLMoeTextConfig",
-    "Qwen3VLMoeVisionConfig",
-    "Qwen3VLMoeVisionModel",
-    "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3VLMoeModel",  # noqa
-    "Qwen3VLMoePreTrainedModel",
-    "Qwen3VLMoeTextModel",
+    "Flex_Qwen2_5_VLMoeConfig",
+    "Flex_Qwen2_5_VLMoeTextConfig",
+    "Flex_Qwen2_5_VLMoeVisionConfig",
+    "Flex_Qwen2_5_VLMoeVisionModel",
+    "Flex_Qwen2_5_VLMoeForConditionalGeneration",
+    "Flex_Qwen2_5_VLMoeModel",  # noqa
+    "Flex_Qwen2_5_VLMoePreTrainedModel",
+    "Flex_Qwen2_5_VLMoeTextModel",
 ]

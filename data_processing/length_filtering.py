@@ -44,7 +44,7 @@ class Config:
     seed: int = 2026
 
     # Filtering: at least one must be set; if both are set, the stricter wins
-    max_vlm_length: Optional[int] = 4096
+    max_vlm_length: Optional[int] = 2048
     max_vlm_length_percentile: Optional[float] = None
 
     # Minimum image dimensions — examples with any image smaller than this are
