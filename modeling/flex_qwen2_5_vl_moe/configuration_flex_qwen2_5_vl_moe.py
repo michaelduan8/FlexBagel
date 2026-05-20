@@ -234,4 +234,4 @@ class Flex_Qwen2_5_VLMoeConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["Flex_Qwen2_5_VLMoeConfig", "Flex_Qwen2_5_VLMoeTextConfig"]
+__all__ = ["Flex_Qwen2_5_VLMoeConfig", "Flex_Qwen2_5_VLMoeTextConfig", "Flex_Qwen2_5_VLMoeVisionConfig"]

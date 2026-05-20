@@ -36,7 +36,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
-from .configuration_flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeTextConfig, Flex_Qwen2_5_VLVisionMoeConfig
+from .configuration_flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeTextConfig, Flex_Qwen2_5_VLMoeVisionConfig
 
 logger = logging.get_logger(__name__)
 
@@ -69,8 +69,9 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
             [Flex_Qwen2_5_VLMoeMLP(config, bias=bias) for _ in range(self.num_experts)]
         )
 
-        self.shared_expert = Flex_Qwen2_5_VLMoeMLP(config, intermediate_size=config.shared_expert_intermediate_size, bias=bias)
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        # TODO: disabling shared expert
+        # self.shared_expert = Flex_Qwen2_5_VLMoeMLP(config, intermediate_size=config.shared_expert_intermediate_size, bias=bias)
+        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -110,10 +111,11 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
             # the `top_x` tensor here.
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
-        shared_expert_output = self.shared_expert(hidden_states)
-        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+        # TODO: not in use rn
+        # shared_expert_output = self.shared_expert(hidden_states)
+        # shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
 
-        final_hidden_states = final_hidden_states + shared_expert_output
+        final_hidden_states = final_hidden_states # + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
@@ -588,7 +590,7 @@ class Flex_Qwen2_5_VLMoeModelOutputWithPast(ModelOutput):
 
 
 class Flex_Qwen2_5_VLMoeRotaryEmbedding(nn.Module):
-    def __init__(self, config: Qwen2_5_VLTextConfig, device=None):
+    def __init__(self, config: Flex_Qwen2_5_VLMoeTextConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -878,7 +880,7 @@ class Flex_Qwen2_5_VLMoeTextModel(Flex_Qwen2_5_VLMoePreTrainedModel):
             [Flex_Qwen2_5_VLMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
-        self.norm = Flex_Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Flex_Qwen2_5_VLMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Flex_Qwen2_5_VLMoeRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
@@ -1041,6 +1043,7 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+        print(config)
         self.visual = Flex_Qwen2_5_VLMoeVisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Flex_Qwen2_5_VLMoeTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
