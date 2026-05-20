@@ -543,6 +543,89 @@ def batched_indices(n: int, batch_size: int) -> Iterable[range]:
         yield range(start, min(n, start + batch_size))
 
 
+_BAD_IMAGE_ERROR_MARKERS = (
+    "broken data stream",
+    "cannot identify image file",
+    "image file is truncated",
+    "truncated file read",
+    "unidentifiedimageerror",
+    "failed to read image",
+    "cannot read image",
+    "invalid image",
+    "no such file or directory",
+    "file not found",
+    "is a directory",
+    "permission denied",
+    "decompressionbomb",
+)
+
+
+def _exception_chain_text(error: BaseException) -> str:
+    """Return reprs from an exception and its chained causes/contexts."""
+    parts: List[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = error
+
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}: {cur!s}")
+        cur = cur.__cause__ or cur.__context__
+
+    return " | ".join(parts)
+
+
+def _is_bad_image_error(error: BaseException) -> bool:
+    """Best-effort classifier for image decode/path failures that are safe to skip."""
+    text = _exception_chain_text(error).lower()
+    return any(marker in text for marker in _BAD_IMAGE_ERROR_MARKERS)
+
+
+def _write_skipped_row(
+    skip_f: Any,
+    *,
+    source_row_idx: int,
+    ex: Dict[str, Any],
+    mode: str,
+    error: BaseException,
+) -> None:
+    skip_row = {
+        "source_row_idx": source_row_idx,
+        "prompt_id": ex.get("prompt_id"),
+        "image_paths": ex.get("image_paths", []),
+        "embed_mode": mode,
+        "error_type": type(error).__name__,
+        "error": _exception_chain_text(error),
+    }
+    skip_f.write(json.dumps(skip_row, ensure_ascii=False) + "\n")
+
+
+def _compact_memmap(
+    *,
+    full_path: Path,
+    final_path: Path,
+    written: int,
+    batch_size: int,
+) -> None:
+    """Replace the full-size temporary .npy with a compact .npy containing only written rows."""
+    full = np.load(full_path, mmap_mode="r")
+    dim = int(full.shape[1])
+    trimmed_path = final_path.with_name(f".{final_path.stem}.trimmed.tmp.npy")
+
+    trimmed = np.lib.format.open_memmap(
+        trimmed_path, mode="w+", dtype=np.float32, shape=(written, dim)
+    )
+    copy_chunk = max(batch_size * 1024, 1024)
+    for start in range(0, written, copy_chunk):
+        end = min(written, start + copy_chunk)
+        trimmed[start:end] = full[start:end]
+
+    trimmed.flush()
+    del trimmed
+    del full
+    os.replace(trimmed_path, final_path)
+    full_path.unlink(missing_ok=True)
+
+
 def embed_one_mode(
     dataset: Dataset,
     model: torch.nn.Module,
@@ -550,64 +633,94 @@ def embed_one_mode(
     args: EmbedArgs,
     mode: str,
     device: torch.device,
-) -> None:
+) -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     emb_path = out_dir / f"embeddings_{mode}.npy"
+    tmp_emb_path = out_dir / f".embeddings_{mode}.full.tmp.npy"
     meta_path = out_dir / f"metadata_{mode}.jsonl"
+    skip_path = out_dir / f"skipped_{mode}.jsonl"
 
     n = len(dataset)
     mmap = None
     written = 0
+    skipped_bad_images = 0
 
-    with meta_path.open("w", encoding="utf-8") as meta_f:
+    tmp_emb_path.unlink(missing_ok=True)
+
+    with meta_path.open("w", encoding="utf-8") as meta_f, skip_path.open("w", encoding="utf-8") as skip_f:
         for idx_range in batched_indices(n, args.batch_size):
-            examples = [dataset[int(i)] for i in idx_range]
+            source_indices = [int(i) for i in idx_range]
+            examples = [dataset[i] for i in source_indices]
             messages_batch = [
                 build_messages_for_processor(ex, mode=mode, instruction=args.instruction)
                 for ex in examples
             ]
+            valid_examples: List[tuple[int, Dict[str, Any]]] = list(zip(source_indices, examples))
 
             try:
                 emb = embed_conversations(model, processor, messages_batch, args, device)
             except Exception as batch_error:
-                if len(examples) == 1:
-                    raise RuntimeError(
-                        f"Embedding failed for row_idx={int(list(idx_range)[0])}, "
-                        f"prompt_id={examples[0]['prompt_id']}, images={examples[0]['image_paths']}"
-                    ) from batch_error
-
                 print(
                     f"Batch failed at rows {idx_range.start}:{idx_range.stop}; "
-                    f"retrying one-by-one. Error: {repr(batch_error)}"
+                    f"retrying one-by-one. Error: {_exception_chain_text(batch_error)}"
                 )
                 emb_list = []
-                for local_i, ex in zip(idx_range, examples):
+                valid_examples = []
+
+                for source_row_idx, ex in zip(source_indices, examples):
                     one_messages = [build_messages_for_processor(ex, mode=mode, instruction=args.instruction)]
                     try:
                         one = embed_conversations(model, processor, one_messages, args, device)
                         emb_list.append(one[0])
+                        valid_examples.append((source_row_idx, ex))
                     except Exception as one_error:
-                        raise RuntimeError(
-                            f"Embedding failed for row_idx={int(local_i)}, "
-                            f"prompt_id={ex['prompt_id']}, images={ex['image_paths']}"
-                        ) from one_error
+                        if not _is_bad_image_error(one_error):
+                            raise RuntimeError(
+                                f"Embedding failed for row_idx={source_row_idx}, "
+                                f"prompt_id={ex['prompt_id']}, images={ex['image_paths']}. "
+                                "This did not look like a bad-image decode/path error, so it was not skipped."
+                            ) from one_error
+
+                        skipped_bad_images += 1
+                        _write_skipped_row(
+                            skip_f,
+                            source_row_idx=source_row_idx,
+                            ex=ex,
+                            mode=mode,
+                            error=one_error,
+                        )
+                        print(
+                            f"[{mode}] skipping bad-image row_idx={source_row_idx}, "
+                            f"prompt_id={ex['prompt_id']}: {_exception_chain_text(one_error)}"
+                        )
+
+                if len(emb_list) == 0:
+                    processed = idx_range.stop
+                    if processed % max(args.batch_size * 10, 1) == 0 or processed == n:
+                        print(
+                            f"[{mode}] processed {processed}/{n}; "
+                            f"embedded {written}; skipped_bad_images {skipped_bad_images}"
+                        )
+                    continue
+
                 emb = np.stack(emb_list, axis=0).astype(np.float32)
 
             if mmap is None:
                 dim = emb.shape[-1]
-                print(f"Creating {emb_path} with shape ({n}, {dim})")
+                print(f"Creating temporary {tmp_emb_path} with max shape ({n}, {dim})")
                 mmap = np.lib.format.open_memmap(
-                    emb_path, mode="w+", dtype=np.float32, shape=(n, dim)
+                    tmp_emb_path, mode="w+", dtype=np.float32, shape=(n, dim)
                 )
 
             bsz = emb.shape[0]
             mmap[written : written + bsz] = emb
 
-            for j, ex in enumerate(examples):
+            for j, (source_row_idx, ex) in enumerate(valid_examples):
                 row = {
                     "row_idx": written + j,
+                    "source_row_idx": source_row_idx,
                     "prompt_id": ex["prompt_id"],
                     "image_paths": ex["image_paths"],
                     "embed_mode": mode,
@@ -622,14 +735,45 @@ def embed_one_mode(
                 meta_f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
             written += bsz
-            if written % max(args.batch_size * 10, 1) == 0 or written == n:
-                print(f"[{mode}] embedded {written}/{n}")
+            processed = idx_range.stop
+            if processed % max(args.batch_size * 10, 1) == 0 or processed == n:
+                print(
+                    f"[{mode}] processed {processed}/{n}; "
+                    f"embedded {written}; skipped_bad_images {skipped_bad_images}"
+                )
 
     if mmap is not None:
         mmap.flush()
+        del mmap
+
+    if written == 0:
+        tmp_emb_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"No embeddings were written for mode={mode}. "
+            f"Skipped {skipped_bad_images} bad-image row(s). See: {skip_path}"
+        )
+
+    if written < n:
+        print(f"[{mode}] compacting embeddings from max shape ({n}, dim) to ({written}, dim)")
+        _compact_memmap(
+            full_path=tmp_emb_path,
+            final_path=emb_path,
+            written=written,
+            batch_size=args.batch_size,
+        )
+    else:
+        os.replace(tmp_emb_path, emb_path)
+
+    if skipped_bad_images == 0:
+        skip_path.unlink(missing_ok=True)
 
     print(f"Saved embeddings to: {emb_path}")
     print(f"Saved metadata to:   {meta_path}")
+    print(f"[{mode}] skipped bad-image rows: {skipped_bad_images}")
+    if skipped_bad_images > 0:
+        print(f"Saved skipped-row report to: {skip_path}")
+
+    return skipped_bad_images
 
 
 def print_dry_run(dataset: Dataset, args: EmbedArgs) -> None:
@@ -664,39 +808,50 @@ def main() -> None:
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive")
 
-    torch.set_grad_enabled(False)
+    emb_path = args.output_dir / f"embeddings_{args.embed_mode}.npy"
+    if not emb_path.exists():
+        torch.set_grad_enabled(False)
 
-    dataset = prepare_datasets(args)
-    if len(dataset) == 0:
-        raise ValueError("No rows left after preprocessing/filtering.")
+        dataset = prepare_datasets(args)
+        if len(dataset) == 0:
+            raise ValueError("No rows left after preprocessing/filtering.")
 
-    if args.dry_run_examples > 0:
-        print_dry_run(dataset, args)
-        return
+        if args.dry_run_examples > 0:
+            print_dry_run(dataset, args)
+            return
 
-    device = resolve_device(args.device)
+        device = resolve_device(args.device)
 
-    print(f"Loading processor: {args.model_name_or_path}")
-    processor = AutoProcessor.from_pretrained(
-        args.model_name_or_path,
-        trust_remote_code=args.trust_remote_code,
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-    )
+        print(f"Loading processor: {args.model_name_or_path}")
+        processor = AutoProcessor.from_pretrained(
+            args.model_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+        )
 
-    model_kwargs = make_model_kwargs(args)
-    print(f"Loading embedding model: {args.model_name_or_path}")
-    print(f"Model kwargs: {model_kwargs}")
-    model = AutoModelForImageTextToText.from_pretrained(
-        args.model_name_or_path,
-        **model_kwargs,
-    )
-    model.to(device)
-    model.eval()
+        model_kwargs = make_model_kwargs(args)
+        print(f"Loading embedding model: {args.model_name_or_path}")
+        print(f"Model kwargs: {model_kwargs}")
+        model = AutoModelForImageTextToText.from_pretrained(
+            args.model_name_or_path,
+            **model_kwargs,
+        )
+        model.to(device)
+        model.eval()
 
-    modes = ["prompt", "image_only"] if args.embed_mode == "both" else [args.embed_mode]
-    for mode in modes:
-        embed_one_mode(dataset, model, processor, args, mode, device)
+        modes = ["prompt", "image_only"] if args.embed_mode == "both" else [args.embed_mode]
+        total_skipped_bad_images = 0
+        for mode in modes:
+            total_skipped_bad_images += embed_one_mode(dataset, model, processor, args, mode, device)
+
+        print(f"Total skipped bad-image rows across requested mode(s): {total_skipped_bad_images}")
+    
+    else:
+        embeddings = np.load(emb_path)
+        row_average = np.mean(embeddings, axis=0)
+        print("Final embeddings shape:", row_average.shape)
+        np.save(f"{args.output_dir}/average_embeddings_{args.embed_mode}.npy", row_average)
 
 
 if __name__ == "__main__":
