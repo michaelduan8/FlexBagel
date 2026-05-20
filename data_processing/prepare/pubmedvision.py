@@ -11,10 +11,11 @@ from datasets import load_dataset, concatenate_datasets
 
 
 def normalize_image_path(image: str, raw_data_dir: Path) -> str:
-    for i in range(1, 20):  # 1 through 19
-        target_path = os.path.join(raw_data_dir, f"images_{i}", "images", image.removeprefix("../"))
-        if os.path.exists(target_path):
-            return target_path
+    # for i in range(1, 20):  # 1 through 19
+    # f"images_{i}", 
+    target_path = os.path.join(raw_data_dir, image.removeprefix("../"))
+    if os.path.exists(target_path):
+        return target_path
     return "non_existent_image.jpg"
 
 # def row_has_existing_image(row: dict[str, Any], raw_data_dir: Path) -> bool:
@@ -64,8 +65,11 @@ def map_row(row: pd.Series, idx: int, raw_data_dir: Path) -> dict[str, Any]:
         f"{len(normalized_conversation)} in row with id {row['id']}."
     )
 
+    raw_images = row["image"]
+
     return {
         "id": row["id"],
+        "orig_images": raw_images,
         "images": normalized_images,
         "conversation": normalized_conversation,
     }

@@ -54,6 +54,7 @@ def map_row(row: dict[str, Any], idx: int, raw_data_dir: Path) -> dict[str, Any]
     out = {}
     out["id"] = f"surg390k-{idx:06d}"
 
+    out["orig_images"] = [image]
     out["images"] = [normalized_image]
 
     normalized_conversation = []

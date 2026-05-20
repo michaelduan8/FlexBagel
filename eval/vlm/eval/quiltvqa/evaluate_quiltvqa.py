@@ -37,9 +37,10 @@ class ResultEntry:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batched multimodal inference with vLLM.")
     parser.add_argument("--model_id",          type=str, required=True,  help="Path to model checkpoint")
-    parser.add_argument("--dataset",           type=str, required=True,  help="Path to test data JSONL")
+    parser.add_argument("--dataset",           type=str, required=True,  help="Path to test data JSON or JSONL")
+    parser.add_argument("--raw_data_dir",       type=str, required=True, help="Directory containing raw data (e.g. images)")
     parser.add_argument("--result_folder",      type=str, required=True,  help="Directory to save results")
-    parser.add_argument("--batch_size",         type=int, default=128,   help="Items per batch per worker")
+    parser.add_argument("--batch_size",         type=int, default=64,   help="Items per batch per worker")
     parser.add_argument("--num_gpus",           type=int, default=1,     help="Number of GPUs (data-parallel workers)")
     return parser.parse_args()
 
@@ -62,32 +63,21 @@ def get_sampling_params() -> SamplingParams:
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
-def build_conversation(idx, item) -> dict:
-    """Format a single item into vLLM chat format.
-    Returns (conversation, ground_truth_response)."""
+def build_conversation(item, raw_data_dir) -> dict:
+    """Load the image for one item and format it into vLLM chat format."""
     question = item["question"]
-    answer = item["answer"]
     image = item["image"]
-    context = item["context"]
-    answer_type = item["answer_type"]
 
+    image_path = os.path.join(raw_data_dir, image)
+    assert os.path.exists(image_path), f"Image not found: {image_path}"
 
-    query = [{
+    return [{
         "role": "user",
         "content": [
-            {"type": "image_pil", "image_pil": image},
+            {"type": "image_pil", "image_pil": Image.open(image_path).convert("RGB")},
             {"type": "text", "text": question}
         ],
     }]
-
-    return {
-        "id": f"quilt_vqa-{idx:06d}",
-        "question": question,
-        "answer_gt": answer,
-        "query": query,
-        "context": context,
-        "answer_type": answer_type
-    }
 
 # ── Inference ──────────────────────────────────────────────────────────────────
 
@@ -95,6 +85,7 @@ def run_worker(
     rank:            int,
     model_id:        str,
     shard:           list[dict],
+    raw_data_dir:    str,
     batch_size:      int,
     result_queue:    mp.Queue,
 ) -> None:
@@ -113,7 +104,8 @@ def run_worker(
         leave=True,
     ):
         start  = batch_idx * batch_size
-        batch  = shard[start : start + batch_size]
+        batch_items = shard[start : start + batch_size]
+        batch = [build_conversation(item, raw_data_dir) for item in batch_items]
 
         outputs = llm.chat(batch, sampling_params)
         results.extend(outputs)
@@ -124,6 +116,7 @@ def run_worker(
 def run_data_parallel(
     model_id:   str,
     test_data:  list[dict],
+    raw_data_dir: str,
     batch_size: int,
     num_gpus:   int,
 ) -> list[ResultEntry]:
@@ -134,7 +127,7 @@ def run_data_parallel(
     procs = [
         mp.Process(
             target=run_worker,
-            args=(rank, model_id, shards[rank], batch_size, queue),
+            args=(rank, model_id, shards[rank], raw_data_dir, batch_size, queue),
         )
         for rank in range(num_gpus)
     ]
@@ -149,6 +142,7 @@ def run_data_parallel(
     for rank, worker_results in all_results:      # rank is now correct regardless of queue order
         for local_idx, entry in enumerate(worker_results):
             ordered[local_idx * num_gpus + rank] = entry
+
     return ordered
 
 
@@ -167,9 +161,8 @@ def save_results(results: list[ResultEntry], folder: str) -> str:
 def main() -> None:
     args      = parse_args()
 
-    dataset = load_dataset(args.dataset, split="train")
-    test_metadata = [build_conversation(idx, item) for idx, item in enumerate(dataset)]
-    test_data = [item["query"] for item in test_metadata]
+    dataset = load_dataset("json", data_files=args.dataset, split="train")
+    test_metadata = [dict(item) for item in dataset]
 
     print(f"Loaded {len(test_metadata)} test items")
     print(f"First: {test_metadata[0]}  |  Last: {test_metadata[-1]}")
@@ -177,7 +170,8 @@ def main() -> None:
 
     results = run_data_parallel(
         model_id=args.model_id,
-        test_data=test_data,
+        test_data=test_metadata,
+        raw_data_dir=args.raw_data_dir,
         batch_size=args.batch_size,
         num_gpus=args.num_gpus,
     )
@@ -185,8 +179,7 @@ def main() -> None:
     # TODO: add outputs to test_metadata
     for meta, res in zip(test_metadata, results):
         output = res.outputs[0].text.strip()
-        meta.pop("query")  # remove query to save space
-        meta["answer"] = output
+        meta["pred"] = output
 
     result_path = save_results(test_metadata, args.result_folder)
     print(f"Done. {len(test_metadata)} results saved to {result_path}")
