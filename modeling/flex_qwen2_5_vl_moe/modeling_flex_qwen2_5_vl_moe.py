@@ -75,8 +75,20 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        if hidden_states.ndim == 2:
+            original_ndim = 2
+            sequence_length, hidden_dim = hidden_states.shape
+            batch_size = 1
+            hidden_states = hidden_states.unsqueeze(0)
+
+        elif hidden_states.ndim == 3:
+            original_ndim = 3
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        else:
+            raise ValueError(f"Expected 2D or 3D hidden_states, got {hidden_states.shape}")
+        # batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_dim)  # changed from view -> reshape
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
@@ -98,8 +110,10 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         # Loop over all available experts in the model and perform the computation on each expert
         expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hitted:
+            expert_idx = expert_idx.item()  # added
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+
+            idx, top_x = torch.where(expert_mask[expert_idx])  # removed .squeeze(0)
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
@@ -118,6 +132,10 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states # + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+        if original_ndim == 2:
+            final_hidden_states = final_hidden_states.squeeze(0)
+
         return final_hidden_states, router_logits
 
 
@@ -1428,7 +1446,7 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            output_router_logits=outputs.output_router_logits,
+            router_logits=outputs.router_logits,
             rope_deltas=self.rope_deltas,
         )
         return output if return_dict else output.to_tuple()
@@ -1462,7 +1480,7 @@ class Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(ModelOutput):
     past_key_values: Optional[list[torch.FloatTensor]] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
-    output_router_logits: Optional[tuple[torch.FloatTensor]] = None
+    router_logits: Optional[tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
 
 

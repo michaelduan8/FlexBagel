@@ -17,8 +17,27 @@ from datetime import datetime
 from dotenv import load_dotenv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image as PILImage
-from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor
+from PIL import ImageFile
+import struct
+from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from trl import SFTTrainer, SFTConfig
+from modeling.flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration
+
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+_ORIG_GETEXIF = PILImage.Image.getexif
+
+def safe_getexif(self):
+    try:
+        return _ORIG_GETEXIF(self)
+    except (SyntaxError, OSError, ValueError, struct.error) as e:
+        # Broken EXIF/TIFF metadata. Ignore EXIF orientation instead of crashing.
+        filename = getattr(self, "filename", None)
+        print(f"[WARN] Ignoring broken EXIF for image: {filename}, error={repr(e)}")
+        return {}
+
+PILImage.Image.getexif = safe_getexif
 
 @dataclass
 class SFTArgs:
@@ -152,6 +171,12 @@ def measure_vlm_lengths(dataset, processor, n=200):
 def register_local_architectures():
     print("Registering local architectures...")
 
+    # Register configs to AutoConfig
+    AutoConfig.register("flex_qwen2_5_vl_moe", Flex_Qwen2_5_VLMoeConfig)
+
+    # Register models to AutoModelForCausalLM
+    AutoModelForImageTextToText.register(Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration)
+
 
 def preprocess_dataset(dataset):
     """Convert dataset to conversational prompt-completion format for SFTTrainer."""
@@ -188,7 +213,8 @@ def preprocess_dataset(dataset):
         return item
 
     def convert_row(item):
-        assert "images" in item and "conversation" in item and "id" in item
+        image_key = "images"
+        assert image_key in item and "conversation" in item and "id" in item
 
         # Convert bytes → PIL here, no multiprocessing so no pickling issues
         # images = []
@@ -225,7 +251,7 @@ def preprocess_dataset(dataset):
         assert conversation[-1]["role"] == "assistant"
         assert len(conversation) <= 3
 
-        images = item["images"]
+        images = item[image_key]
 
         prompt = []
         # TODO: not sure how to handle multiturn data
@@ -401,64 +427,146 @@ class WandbLoggingCallback(TrainerCallback):
     #     return ["q_proj", "v_proj"]
 
 
-# def print_trainable_parameters(model):
-    # """Print the number of trainable parameters in the model."""
-    # trainable_params = 0
-    # all_param = 0
-    # for _, param in model.named_parameters():
-    #     all_param += param.numel()
-    #     if param.requires_grad:
-    #         trainable_params += param.numel()
+def print_trainable_parameters(model):
+    """Print the number of trainable parameters in the model."""
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
 
-    # trainable_pct = 100 * trainable_params / all_param
-    # print(f"Trainable params: {trainable_params:,} || All params: {all_param:,} || Trainable%: {trainable_pct:.4f}")
-    # return trainable_params, all_param, trainable_pct
-
-
-# def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False):
-    # """
-    # Freeze all parameters except the target expert's FFN and its router row.
-
-    # If use_lora=True, all base weights are frozen here and LoRA adapters will be
-    # inserted on top of the target expert's modules afterward — so we don't need to
-    # unfreeze the expert FFN weights themselves (the LoRA adapters are trainable by
-    # default).
-
-    # If use_lora=False, the target expert's FFN weights are unfrozen for full
-    # fine-tuning.
-
-    # The router gate row for expert_idx is kept trainable. Gradient masking for the
-    # router is handled by ExpertSFTTrainer.training_step, which zeroes out all
-    # router gradient rows except expert_idx after each backward pass, before the
-    # optimizer step. This is cleaner than a backward hook because it avoids polluting
-    # Adam's momentum/variance buffers for the frozen rows.
-
-    # Args:
-    #     model: The MoE model to modify.
-    #     expert_idx: Index of the expert to train.
-    #     use_lora: Whether LoRA will be applied after this call.
-    # """
-    # for name, param in model.named_parameters():
-    #     if not use_lora and f".mlp.experts.{expert_idx}." in name:
-    #         param.requires_grad = True
-    #         print(f"[trainable] {name}")
-    #     elif ".mlp.gate.weight" in name:
-    #         # Unfreeze the whole gate; ExpertSFTTrainer masks gradients for all
-    #         # rows except expert_idx after each backward pass.
-    #         param.requires_grad = True
-    #         print(f"[trainable-router] {name}")
-    #     else:
-    #         param.requires_grad = False
+    trainable_pct = 100 * trainable_params / all_param
+    print(f"Trainable params: {trainable_params:,} || All params: {all_param:,} || Trainable%: {trainable_pct:.4f}")
+    return trainable_params, all_param, trainable_pct
 
 
-# def freeze_all_except_router(model):
-    # """Freeze all parameters except MoE router gate weights."""
-    # for name, param in model.named_parameters():
-    #     if ".mlp.gate.weight" in name:
-    #         param.requires_grad = True
-    #         print(f"[trainable-router] {name}")
-    #     else:
-    #         param.requires_grad = False
+def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False, verbose: bool = True):
+    """
+    Freeze all parameters except the target expert and router gates in BOTH:
+      1. decoder MoE blocks:      model.language_model.layers.*.mlp
+      2. vision tower MoE blocks: model.visual.blocks.*.mlp
+
+    If use_lora=True:
+        Base expert weights stay frozen. LoRA adapters should be inserted after
+        this call and will be trainable by default.
+
+    If use_lora=False:
+        The target expert FFN weights are unfrozen for full fine-tuning.
+
+    Router gates:
+        The full gate.weight is unfrozen because PyTorch cannot set
+        requires_grad=True for only one row. Your trainer should mask all router
+        gradient rows except expert_idx before optimizer.step().
+    """
+
+    def is_sparse_moe_block(module):
+        return (
+            hasattr(module, "experts")
+            and hasattr(module, "gate")
+            and hasattr(module.gate, "weight")
+        )
+
+    def get_scope(module_name: str) -> str:
+        parts = module_name.split(".")
+
+        # Works when called on Flex_Qwen2_5_VLMoeForConditionalGeneration
+        # or on the inner Flex_Qwen2_5_VLMoeModel.
+        if "visual" in parts and "blocks" in parts:
+            return "vision"
+        if "language_model" in parts and "layers" in parts:
+            return "decoder"
+
+        # Works if you pass model.visual or model.language_model directly.
+        if len(parts) > 0 and parts[0] == "blocks":
+            return "vision"
+        if len(parts) > 0 and parts[0] == "layers":
+            return "decoder"
+
+        return "other"
+
+    # 1. Freeze everything first.
+    for _, param in model.named_parameters():
+        param.requires_grad = False
+
+    num_decoder_moe = 0
+    num_vision_moe = 0
+    num_other_moe = 0
+    trainable_names = []
+
+    # 2. Unfreeze target expert + router gate in every SparseMoeBlock.
+    for module_name, module in model.named_modules():
+        if not is_sparse_moe_block(module):
+            continue
+
+        scope = get_scope(module_name)
+
+        if expert_idx < 0 or expert_idx >= len(module.experts):
+            raise ValueError(
+                f"expert_idx={expert_idx} is invalid for {module_name}; "
+                f"this block has {len(module.experts)} experts."
+            )
+
+        if scope == "decoder":
+            num_decoder_moe += 1
+        elif scope == "vision":
+            num_vision_moe += 1
+        else:
+            num_other_moe += 1
+
+        # Full fine-tuning case: unfreeze the target expert FFN.
+        # LoRA case: keep base expert frozen; LoRA adapters are added later.
+        if not use_lora:
+            target_expert = module.experts[expert_idx]
+            for pname, param in target_expert.named_parameters():
+                param.requires_grad = True
+                full_name = f"{module_name}.experts.{expert_idx}.{pname}".lstrip(".")
+                trainable_names.append(full_name)
+                if verbose:
+                    print(f"[trainable-{scope}-expert] {full_name}")
+
+        # Router: unfreeze whole gate.weight.
+        # Your trainer masks rows except expert_idx after backward.
+        for pname, param in module.gate.named_parameters():
+            param.requires_grad = True
+            full_name = f"{module_name}.gate.{pname}".lstrip(".")
+            trainable_names.append(full_name)
+            if verbose:
+                print(f"[trainable-{scope}-router] {full_name}")
+
+    if num_decoder_moe + num_vision_moe + num_other_moe == 0:
+        raise RuntimeError(
+            "No SparseMoeBlock found. Check that you passed the full VLM model, "
+            "or that the model actually has num_experts > 0."
+        )
+
+    if verbose:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+
+        print(
+            "[freeze_all_except_expert] "
+            f"decoder MoE blocks={num_decoder_moe}, "
+            f"vision MoE blocks={num_vision_moe}, "
+            f"other MoE blocks={num_other_moe}"
+        )
+        print(
+            "[freeze_all_except_expert] "
+            f"trainable params={trainable_params:,} / {total_params:,} "
+            f"({100 * trainable_params / total_params:.4f}%)"
+        )
+
+    return trainable_names
+
+
+def freeze_all_except_router(model):
+    """Freeze all parameters except MoE router gate weights."""
+    for name, param in model.named_parameters():
+        if ".mlp.gate.weight" in name:
+            param.requires_grad = True
+            print(f"[trainable-router] {name}")
+        else:
+            param.requires_grad = False
 
 
 # def unfreeze_attention_layers(model):
@@ -510,31 +618,31 @@ class WandbLoggingCallback(TrainerCallback):
     # print(f"Unfroze embedding parameters: {trainable_count}")
 
 
-# class ExpertSFTTrainer(SFTTrainer):
-    # """
-    # SFTTrainer subclass that zeroes out router gate gradients for all experts
-    # except the target one, after backward but before the optimizer step.
+class ExpertSFTTrainer(SFTTrainer):
+    """
+    SFTTrainer subclass that zeroes out router gate gradients for all experts
+    except the target one, after backward but before the optimizer step.
 
-    # This is preferable to a backward hook because the gradient zeroing happens
-    # at a well-defined point in the training loop, and Adam's momentum/variance
-    # buffers for the frozen rows are never updated with non-zero values.
-    # """
-    # def __init__(self, *args, expert_idx: int = None, **kwargs):
-    #     super().__init__(*args, **kwargs)
-    #     self.expert_idx = expert_idx
+    This is preferable to a backward hook because the gradient zeroing happens
+    at a well-defined point in the training loop, and Adam's momentum/variance
+    buffers for the frozen rows are never updated with non-zero values.
+    """
+    def __init__(self, *args, expert_idx: int = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.expert_idx = expert_idx
 
-    # def training_step(self, model, inputs, num_items_in_batch=None):
-    #     loss = super().training_step(model, inputs, num_items_in_batch)
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch)
 
-    #     if self.expert_idx is not None:
-    #         for name, param in model.named_parameters():
-    #             if ".mlp.gate.weight" in name and param.grad is not None:
-    #                 with torch.no_grad():
-    #                     mask = torch.zeros_like(param.grad)
-    #                     mask[self.expert_idx] = 1.0
-    #                     param.grad *= mask
+        if self.expert_idx is not None:
+            for name, param in model.named_parameters():
+                if ".mlp.gate.weight" in name and param.grad is not None:
+                    with torch.no_grad():
+                        mask = torch.zeros_like(param.grad)
+                        mask[self.expert_idx] = 1.0
+                        param.grad *= mask
 
-    #     return loss
+        return loss
 
 
 
@@ -659,39 +767,55 @@ def main():
 
     use_bf16 = torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
-    model = AutoModelForImageTextToText.from_pretrained(
+    model = Flex_Qwen2_5_VLMoeForConditionalGeneration.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
         attn_implementation="flash_attention_2",
         device_map=None,  # device_map conflicts with DeepSpeed, use auto if single gpu
     )
 
+    print("Loaded model class:", type(model))
+    print("Config class:", type(model.config))
+    print("Model type:", model.config.model_type)
+    print("Conversion mapping:", getattr(model, "_checkpoint_conversion_mapping", None))
+
+    names = [name for name, _ in model.named_parameters()]
+    print("has wrapped language_model:", any(n.startswith("model.language_model.layers.0") for n in names))
+    print("has raw model.layers:", any(n.startswith("model.layers.0") for n in names))
+    print("has wrapped visual:", any(n.startswith("model.visual.blocks.0") for n in names))
+    print("has raw visual:", any(n.startswith("visual.blocks.0") for n in names))
+
     # ------------------------------------------------------------------
     # Expert freezing — must happen before LoRA so that PEFT sees the
     # correct requires_grad state when deciding which modules to wrap.
     # ------------------------------------------------------------------
-    # if sft_args.router_tuning_only:
-    #     print("Freezing all weights except router gate weights.")
-    #     freeze_all_except_router(model)
-    #     model.enable_input_require_grads() # Need this to still build computational graph?
-    #     print_trainable_parameters(model)
-    # elif sft_args.train_expert_idx is not None:
-    #     print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
-    #           f"({'LoRA adapters' if sft_args.use_lora else 'full fine-tune'}).")
-    #     freeze_all_except_expert(
-    #         model,
-    #         expert_idx=sft_args.train_expert_idx,
-    #         use_lora=sft_args.use_lora,
-    #     )
-    #     model.enable_input_require_grads() # Need this to still build computational graph?
+    if sft_args.router_tuning_only:
+        print("Freezing all weights except router gate weights.")
+        freeze_all_except_router(model)
+        model.enable_input_require_grads() # Need this to still build computational graph?
+        print_trainable_parameters(model)
+    elif sft_args.train_expert_idx is not None:
+        print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
+              f"({'LoRA adapters' if sft_args.use_lora else 'full fine-tune'}).")
+        print_trainable_parameters(model)
+        freeze_all_except_expert(
+            model,
+            expert_idx=sft_args.train_expert_idx,
+            use_lora=sft_args.use_lora,
+        )
+        print("After freezing expert:")
+        print_trainable_parameters(model)
+        model.enable_input_require_grads() # Need this to still build computational graph?
 
-    # if sft_args.unfreeze_attn:
-    #     print("unfreeze_attn=True: unfreezing attention layers.")
-    #     unfreeze_attention_layers(model)
+    if sft_args.unfreeze_attn:
+        raise NotImplementedError("unfreeze_attn is not implemented for mm_tune.py")
+        print("unfreeze_attn=True: unfreezing attention layers.")
+        unfreeze_attention_layers(model)
 
-    # if sft_args.unfreeze_embed:
-    #     print("unfreeze_embed=True: unfreezing embedding layers.")
-    #     unfreeze_embedding_layers(model)
+    if sft_args.unfreeze_embed:
+        raise NotImplementedError("unfreeze_embed is not implemented for mm_tune.py")
+        print("unfreeze_embed=True: unfreezing embedding layers.")
+        unfreeze_embedding_layers(model)
 
     # ------------------------------------------------------------------
     # LoRA setup
@@ -798,6 +922,8 @@ def main():
     # VLM-specific safety
     sft_config.remove_unused_columns = False
     sft_config.max_length = None
+    if sft_args.train_expert_idx is not None:
+        sft_config.gradient_checkpointing_kwargs = {"use_reentrant": False}
 
     if sft_args.skip_eval:
         sft_config.eval_strategy = "no"
@@ -831,7 +957,7 @@ def main():
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
-    trainer = SFTTrainer(
+    trainer = ExpertSFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
@@ -863,26 +989,36 @@ def main():
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     final_output_dir = os.path.join(str(checkpoint_path), "final")
 
-    if sft_args.use_lora and sft_args.merge_and_save:
-        print("Merging LoRA weights into base model...")
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(final_output_dir)
-        tokenizer.save_pretrained(final_output_dir)
-        processor.save_pretrained(final_output_dir)
-        print(f"Merged model saved to {final_output_dir}")
-    else:
-        trainer.save_model(output_dir=final_output_dir)
-        tokenizer.save_pretrained(final_output_dir)
-        processor.save_pretrained(final_output_dir)
-        if sft_args.use_lora:
-            print(f"LoRA adapter saved to {final_output_dir}")
 
-    if not sft_args.skip_eval:
+    # Wait for all ranks to finish training
+    trainer.accelerator.wait_for_everyone()
+
+    # Save only from rank 0 / main process
+    if trainer.is_world_process_zero():
+        if sft_args.use_lora and sft_args.merge_and_save:
+            print("Merging LoRA weights into base model...")
+            merged_model = model.merge_and_unload()
+            merged_model.save_pretrained(final_output_dir)
+            tokenizer.save_pretrained(final_output_dir)
+            processor.save_pretrained(final_output_dir)
+            print(f"Merged model saved to {final_output_dir}")
+        else:
+            trainer.save_model(output_dir=final_output_dir)
+            tokenizer.save_pretrained(final_output_dir)
+            processor.save_pretrained(final_output_dir)
+            if sft_args.use_lora:
+                print(f"LoRA adapter saved to {final_output_dir}")
+
+    trainer.accelerator.wait_for_everyone()
+
+    if not sft_args.skip_eval and trainer.is_world_process_zero():
         trainer.evaluate()  # Final evaluation after training
 
-    if sft_args.delete_intermediate_checkpoints:
+    if sft_args.delete_intermediate_checkpoints and trainer.is_world_process_zero():
+        print("Training completed successfully. Deleting intermediate checkpoints...")
         delete_intermediate_checkpoints(checkpoint_path, final_output_dir)
 
+    trainer.accelerator.wait_for_everyone()
     wandb.finish()
     
 if __name__ == "__main__":
