@@ -22,7 +22,7 @@ import struct
 from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from trl import SFTTrainer, SFTConfig
 from modeling.flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration
-
+from torch.optim import AdamW
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -66,6 +66,9 @@ class SFTArgs:
     )
     eval_n_epochs: float = field(default=2.0, metadata={"help": "Evaluate every N epochs"})
     save_n_epochs: float = field(default=1.0, metadata={"help": "Save a checkpoint every N epochs"})
+    lr_vision: float = field(default=None, metadata={"help": "Learning rate for vision tower"})
+    lr_llm: float = field(default=None, metadata={"help": "Learning rate for LLM decoder"})
+    lr_connector: float = field(default=None, metadata={"help": "Learning rate for VL connector MLP"})
     filter_by_id: list[str] = field(
         default=None,
         metadata={"help": "Only keep rows whose prompt_id contains at least one of these substrings. If None, no filtering is applied."}
@@ -100,6 +103,89 @@ class SFTArgs:
         metadata={"help": "Target modules for LoRA. If None, uses default for the model architecture."}
     )
     merge_and_save: bool = field(default=False, metadata={"help": "Merge LoRA weights into base model and save full model"})
+
+
+def build_vlm_optimizer(
+    model,
+    sft_config,
+    lr_vision=None,
+    lr_llm=None,
+    lr_connector=None,
+):
+    """
+    Different LR for:
+      - vision tower:        visual.*
+      - LLM decoder:         language_model.*
+      - VL connector MLP:    visual.merger.mlp.*
+
+    Other optimizer args come from sft_config.
+    """
+
+    # Use sft_config.learning_rate as default if not specified
+    lr_vision = sft_config.learning_rate if lr_vision is None else lr_vision
+    lr_llm = sft_config.learning_rate if lr_llm is None else lr_llm
+    lr_connector = sft_config.learning_rate if lr_connector is None else lr_connector
+
+    vision_params = []
+    llm_params = []
+    connector_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Check connector first because it is inside visual
+        if "visual.merger.mlp." in name:
+            connector_params.append(param)
+
+        elif "visual." in name:
+            vision_params.append(param)
+
+        elif "language_model." in name:
+            llm_params.append(param)
+
+        else:
+            other_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": vision_params,
+            "lr": lr_vision,
+            "weight_decay": sft_config.weight_decay,
+            "name": "vision_tower",
+        },
+        {
+            "params": llm_params,
+            "lr": lr_llm,
+            "weight_decay": sft_config.weight_decay,
+            "name": "llm_decoder",
+        },
+        {
+            "params": connector_params,
+            "lr": lr_connector,
+            "weight_decay": sft_config.weight_decay,
+            "name": "vl_connector_mlp",
+        },
+    ]
+
+    if len(other_params) > 0:
+        optimizer_grouped_parameters.append(
+            {
+                "params": other_params,
+                "lr": lr_llm,
+                "weight_decay": sft_config.weight_decay,
+                "name": "other",
+            }
+        )
+
+    optimizer = AdamW(
+        optimizer_grouped_parameters,
+        betas=(sft_config.adam_beta1, sft_config.adam_beta2),
+        eps=sft_config.adam_epsilon,
+    )
+
+    return optimizer
 
 
 def measure_vlm_lengths(dataset, processor, n=200):
@@ -249,19 +335,32 @@ def preprocess_dataset(dataset):
         id = item["id"]
         conversation = item["conversation"]
         assert conversation[-1]["role"] == "assistant"
-        assert len(conversation) <= 3
+        # assert len(conversation) <= 3
 
         images = item[image_key]
 
         prompt = []
-        # TODO: not sure how to handle multiturn data
+        used_image = False
+
         for turn in conversation[:-1]:
-            if turn["role"] == "user" and turn["img_loc"] is not None:
-                content = [{"type": "text", "text": turn["content"]}]
-                #content = [{"type": "image"} for _ in rgb_bytes] + content if turn["img_loc"] == "before" else content + [{"type": "image"} for _ in rgb_bytes]
-                content = [{"type": "image"} for _ in images] + content if turn["img_loc"] == "before" else content + [{"type": "image"} for _ in images]
-            else:
-                content = [{"type": "text", "text": turn["content"]}]
+            content = [{"type": "text", "text": turn["content"]}]
+
+            # Minimal multi-turn support:
+            # If a user turn has img_loc, attach the top-level images only once.
+            # This avoids duplicating image placeholders across multiple user turns.
+            if (
+                turn["role"] == "user"
+                and turn.get("img_loc") is not None
+                and images
+                and not used_image
+            ):
+                image_content = [{"type": "image"} for _ in images]
+                if turn["img_loc"] == "before":
+                    content = image_content + content
+                else:
+                    content = content + image_content
+                used_image = True
+
             prompt.append({"role": turn["role"], "content": content})
 
         return {
@@ -767,7 +866,7 @@ def main():
 
     use_bf16 = torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
-    model = Flex_Qwen2_5_VLMoeForConditionalGeneration.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
         attn_implementation="flash_attention_2",
@@ -957,12 +1056,21 @@ def main():
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
+    optimizer = build_vlm_optimizer(
+        model,
+        sft_config,
+        lr_vision=sft_args.lr_vision,
+        lr_llm=sft_args.lr_llm,
+        lr_connector=sft_args.lr_connector
+    )
+
     trainer = ExpertSFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         processing_class=processor,
+        optimizers=(optimizer, None),  # let Trainer create scheduler only if you handle it separately
         callbacks=[WandbLoggingCallback(wandb_stats)],
     )
 
