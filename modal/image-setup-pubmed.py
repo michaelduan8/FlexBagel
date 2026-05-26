@@ -31,9 +31,9 @@ LOCAL_FLEXBAGEL = Path(__file__).parent.parent.parent / "FlexBagel"
 
 COMMAND = """
 cd /FlexBagel && PYTHONPATH=. torchrun --master_port=29501 --nproc_per_node=4 train/mm_tune.py \
-    --run_id "pubmedvision_qwen2_5-3b-vl-corrected" \
-    --model Qwen/Qwen2.5-VL-3B-Instruct \
-    --datasets /mnt/pubmedvision/pubmed_vision_train_w_length_w_path.jsonl \
+    --run_id "pubmedvision_qwen2_5-3b-vl-instructional-continued" \
+    --model alrope/pubmedvision_qwen2_5-3b-vl-instructional \
+    --datasets /mnt/pubmedvision/pubmed_vision_train_w_length_w_path_instructional.jsonl \
     --sample_size 1500000 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \

@@ -23,6 +23,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText,
 from trl import SFTTrainer, SFTConfig
 from modeling.flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration
 from torch.optim import AdamW
+from safetensors.torch import load_file, save_file
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -53,6 +54,14 @@ class SFTArgs:
     resume_checkpoint_path: str = field(
         default=None,
         metadata={"help": "Explicit checkpoint path to resume from. Overrides auto_resume."}
+    )
+    fix_resume_checkpoint_keys: bool = field(
+        default=True,
+        metadata={"help": "Before resuming, create/use a runtime-key checkpoint with Qwen2.5-VL parameter keys remapped to the current model wrapper."}
+    )
+    runtime_key_checkpoint_suffix: str = field(
+        default="-runtime-key",
+        metadata={"help": "Suffix for the derived checkpoint directory used after checkpoint key remapping."}
     )
     delete_intermediate_checkpoints: bool = field(
         default=True,
@@ -803,6 +812,240 @@ def resolve_resume_checkpoint(sft_args, checkpoint_path: pathlib.Path) -> str | 
     return None
 
 
+
+def remap_qwen25vl_runtime_key(key: str) -> str:
+    """
+    Remap legacy Qwen2.5-VL checkpoint keys to the names expected by the
+    currently loaded wrapper model.
+
+    This is needed for Trainer resume because resume_from_checkpoint loads the
+    raw checkpoint state dict directly; it does not go through from_pretrained's
+    checkpoint conversion mapping.
+    """
+    # legacy vision tower:
+    # visual.blocks... -> model.visual.blocks...
+    if key.startswith("visual."):
+        return "model.visual." + key[len("visual."):]
+
+    # legacy language model:
+    # model.layers...       -> model.language_model.layers...
+    # model.embed_tokens... -> model.language_model.embed_tokens...
+    # model.norm...         -> model.language_model.norm...
+    if key.startswith("model.") and not (
+        key.startswith("model.visual.")
+        or key.startswith("model.language_model.")
+    ):
+        return "model.language_model." + key[len("model."):]
+
+    # lm_head and already-correct keys stay unchanged.
+    return key
+
+
+def get_runtime_key_checkpoint_path(
+    resume_checkpoint: str | None,
+    suffix: str = "-runtime-key",
+) -> str | None:
+    """
+    Return the checkpoint path that trainer.train should use.
+
+    If the checkpoint is a sharded safetensors model, use a derived directory
+    so the original checkpoint remains untouched. Otherwise return the original
+    path unchanged.
+    """
+    if resume_checkpoint is None:
+        return None
+
+    src_ckpt = pathlib.Path(resume_checkpoint).expanduser()
+    if src_ckpt.name.endswith(suffix):
+        return str(src_ckpt)
+
+    if not (src_ckpt / "model.safetensors.index.json").exists():
+        print(
+            f"[checkpoint-key-fix] {src_ckpt} has no model.safetensors.index.json; "
+            "using it unchanged."
+        )
+        return str(src_ckpt)
+
+    return str(src_ckpt.with_name(src_ckpt.name + suffix))
+
+
+def _rewrite_safetensor_shard_keys_if_needed(shard_path: pathlib.Path):
+    """Rewrite one shard in place if it still contains legacy keys."""
+    sd = load_file(str(shard_path), device="cpu")
+    sd2 = {}
+    changed = False
+
+    for old_key, tensor in sd.items():
+        new_key = remap_qwen25vl_runtime_key(old_key)
+        if new_key != old_key:
+            changed = True
+        if new_key in sd2:
+            raise RuntimeError(
+                f"Key collision inside {shard_path.name}: {old_key} -> {new_key}"
+            )
+        sd2[new_key] = tensor
+
+    if not changed:
+        return False
+
+    backup_path = shard_path.with_name(f"{shard_path.name}.legacy_key_backup")
+    if backup_path.exists():
+        raise FileExistsError(
+            f"{backup_path} already exists, but {shard_path} still appears to need remapping. "
+            "Please inspect the checkpoint; a previous run may have stopped midway."
+        )
+
+    shard_path.rename(backup_path)
+    save_file(sd2, str(shard_path), metadata={"format": "pt"})
+    print(f"[checkpoint-key-fix] Rewrote {shard_path.name}")
+    print(f"[checkpoint-key-fix] Backup:  {backup_path.name}")
+    return True
+
+
+def _remap_checkpoint_index_and_shards(ckpt: pathlib.Path):
+    """Apply Fixing Code 1, but make it safe to call repeatedly."""
+    index_path = ckpt / "model.safetensors.index.json"
+    if not index_path.exists():
+        return
+
+    with open(index_path, "r") as f:
+        index = json.load(f)
+
+    old_weight_map = index["weight_map"]
+    new_weight_map = {}
+
+    for old_key, shard_name in old_weight_map.items():
+        new_key = remap_qwen25vl_runtime_key(old_key)
+        if new_key in new_weight_map and new_weight_map[new_key] != shard_name:
+            raise RuntimeError(f"Key collision after remap: {old_key} -> {new_key}")
+        new_weight_map[new_key] = shard_name
+
+    if new_weight_map != old_weight_map:
+        backup_index_path = ckpt / "model.safetensors.index.json.legacy_key_backup"
+        if not backup_index_path.exists():
+            shutil.copy2(index_path, backup_index_path)
+        index["weight_map"] = new_weight_map
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+        print(f"[checkpoint-key-fix] Updated index key names: {index_path}")
+    else:
+        print("[checkpoint-key-fix] Index already uses runtime key names.")
+
+    # Use all shard names now referenced by the updated index. This also lets us
+    # fix a checkpoint whose index was updated but whose shards were not.
+    shard_names = sorted(set(new_weight_map.values()))
+    for shard_name in shard_names:
+        _rewrite_safetensor_shard_keys_if_needed(ckpt / shard_name)
+
+
+def _ensure_lm_head_weight(ckpt: pathlib.Path):
+    """Apply Fixing Code 2: synthesize lm_head.weight from embed_tokens if needed."""
+    index_path = ckpt / "model.safetensors.index.json"
+    if not index_path.exists():
+        return
+
+    embed_key = "model.language_model.embed_tokens.weight"
+    lm_head_key = "lm_head.weight"
+
+    with open(index_path, "r") as f:
+        index = json.load(f)
+
+    weight_map = index["weight_map"]
+
+    if lm_head_key in weight_map:
+        print(f"[checkpoint-key-fix] {lm_head_key} already exists in index: {weight_map[lm_head_key]}")
+        return
+
+    if embed_key not in weight_map:
+        raise KeyError(f"Cannot synthesize {lm_head_key}; missing {embed_key} in index")
+
+    shard_name = weight_map[embed_key]
+    shard_path = ckpt / shard_name
+    backup_path = ckpt / f"{shard_name}.pre_lm_head_backup"
+
+    sd = load_file(str(shard_path), device="cpu")
+    if embed_key not in sd:
+        raise KeyError(f"{embed_key} not found inside {shard_name}")
+
+    if lm_head_key not in sd:
+        if backup_path.exists():
+            raise FileExistsError(
+                f"{backup_path} already exists, but {lm_head_key} is still missing from {shard_name}. "
+                "Please inspect the checkpoint; a previous run may have stopped midway."
+            )
+        sd[lm_head_key] = sd[embed_key].clone()
+        shard_path.rename(backup_path)
+        save_file(sd, str(shard_path), metadata={"format": "pt"})
+        print(f"[checkpoint-key-fix] Added {lm_head_key} to {shard_name}")
+        print(f"[checkpoint-key-fix] Backup: {backup_path.name}")
+
+        added_bytes = sd[lm_head_key].numel() * sd[lm_head_key].element_size()
+        if isinstance(index.get("metadata", {}).get("total_size"), int):
+            index["metadata"]["total_size"] += added_bytes
+    else:
+        print(f"[checkpoint-key-fix] {lm_head_key} already exists inside {shard_name}; only fixing index.")
+
+    weight_map[lm_head_key] = shard_name
+    index["weight_map"] = weight_map
+    with open(index_path, "w") as f:
+        json.dump(index, f, indent=2)
+    print(f"[checkpoint-key-fix] Updated index: {lm_head_key} -> {shard_name}")
+
+
+def prepare_qwen25vl_runtime_key_checkpoint(
+    resume_checkpoint: str | None,
+    suffix: str = "-runtime-key",
+) -> str | None:
+    """
+    Create/use a resume checkpoint whose tensor keys match the runtime model.
+
+    The returned path should be passed to trainer.train(resume_from_checkpoint=...).
+    The original checkpoint is not modified unless the input path already ends
+    with suffix.
+    """
+    if resume_checkpoint is None:
+        return None
+
+    src_ckpt = pathlib.Path(resume_checkpoint).expanduser()
+    if not src_ckpt.exists():
+        raise FileNotFoundError(f"Resume checkpoint does not exist: {src_ckpt}")
+
+    if not (src_ckpt / "model.safetensors.index.json").exists():
+        print(
+            f"[checkpoint-key-fix] {src_ckpt} has no model.safetensors.index.json; "
+            "skipping key fix."
+        )
+        return str(src_ckpt)
+
+    if src_ckpt.name.endswith(suffix):
+        dst_ckpt = src_ckpt
+    else:
+        dst_ckpt = src_ckpt.with_name(src_ckpt.name + suffix)
+        if not dst_ckpt.exists():
+            print(f"[checkpoint-key-fix] Copying checkpoint for runtime-key resume:")
+            print(f"[checkpoint-key-fix]   src: {src_ckpt}")
+            print(f"[checkpoint-key-fix]   dst: {dst_ckpt}")
+            shutil.copytree(src_ckpt, dst_ckpt)
+        else:
+            print(f"[checkpoint-key-fix] Using existing runtime-key checkpoint: {dst_ckpt}")
+
+    _remap_checkpoint_index_and_shards(dst_ckpt)
+    _ensure_lm_head_weight(dst_ckpt)
+
+    marker_path = dst_ckpt / ".qwen25vl_runtime_key_fix_done"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "source_checkpoint": str(src_ckpt),
+                "runtime_checkpoint": str(dst_ckpt),
+                "fixed_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
+    )
+
+    return str(dst_ckpt)
+
 def delete_intermediate_checkpoints(checkpoint_path: pathlib.Path, final_output_dir: str):
     """Delete checkpoint-* directories after training has completed successfully."""
     final_path = pathlib.Path(final_output_dir).resolve()
@@ -996,7 +1239,14 @@ def main():
 
     checkpoint_path = paths["checkpoints"]
     checkpoint_path.mkdir(parents=True, exist_ok=True)
-    resume_checkpoint = resolve_resume_checkpoint(sft_args, checkpoint_path)
+    raw_resume_checkpoint = resolve_resume_checkpoint(sft_args, checkpoint_path)
+    if sft_args.fix_resume_checkpoint_keys:
+        resume_checkpoint = get_runtime_key_checkpoint_path(
+            raw_resume_checkpoint,
+            suffix=sft_args.runtime_key_checkpoint_suffix,
+        )
+    else:
+        resume_checkpoint = raw_resume_checkpoint
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
@@ -1072,7 +1322,24 @@ def main():
         processing_class=processor,
         optimizers=(optimizer, None),  # let Trainer create scheduler only if you handle it separately
         callbacks=[WandbLoggingCallback(wandb_stats)],
+        expert_idx=sft_args.train_expert_idx,
     )
+
+    # Materialize the fixed resume checkpoint after Trainer/Accelerate exists, so
+    # only rank 0 rewrites files and all other ranks wait before loading them.
+    if raw_resume_checkpoint is not None and sft_args.fix_resume_checkpoint_keys:
+        if trainer.is_world_process_zero():
+            fixed_checkpoint = prepare_qwen25vl_runtime_key_checkpoint(
+                raw_resume_checkpoint,
+                suffix=sft_args.runtime_key_checkpoint_suffix,
+            )
+            if fixed_checkpoint != resume_checkpoint:
+                raise RuntimeError(
+                    f"Internal checkpoint path mismatch: expected {resume_checkpoint}, got {fixed_checkpoint}"
+                )
+        trainer.accelerator.wait_for_everyone()
+        if not pathlib.Path(resume_checkpoint).exists():
+            raise FileNotFoundError(f"Fixed resume checkpoint was not created: {resume_checkpoint}")
 
     batch = next(iter(trainer.get_train_dataloader()))
 
