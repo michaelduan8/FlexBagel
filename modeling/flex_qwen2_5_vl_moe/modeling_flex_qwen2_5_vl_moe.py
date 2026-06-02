@@ -1707,17 +1707,31 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
                 self.model.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             elif "position_ids" in model_inputs:
-                position_ids = model_inputs["position_ids"][None, ...]
-                delta = self.model.rope_deltas
-                delta = delta.repeat_interleave(position_ids.shape[1] // delta.shape[0], dim=0)
-                vision_positions = position_ids + delta.expand_as(position_ids)
-                vision_positions = vision_positions.expand(3, vision_positions.shape[1], -1)
+                batch_size, seq_len = model_inputs["input_ids"].shape
+
+                delta = self.model.rope_deltas.to(input_ids.device)
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+
+                vision_positions = torch.arange(seq_len, device=input_ids.device)
+                vision_positions = vision_positions.view(1, -1).expand(batch_size, -1)
+
+                if cache_position is not None:
+                    vision_positions = vision_positions + cache_position[0] + delta
+                else:
+                    vision_positions = vision_positions + delta
+
+                vision_positions = vision_positions.unsqueeze(0).expand(3, -1, -1)
+
+                text_positions = model_inputs["position_ids"].unsqueeze(0)
 
             # Concatenate "text + vision" positions into [4, bs, seq-len]
             if "position_ids" not in model_inputs:
                 text_positions = torch.arange(input_ids, device=input_ids.device)[None, None, :]
             else:
-                text_positions = model_inputs["position_ids"][None, ...]
+                text_positions = torch.arange(
+                    model_inputs["input_ids"].shape[1],
+                    device=input_ids.device,
+                ).view(1, 1, -1).expand(1, input_ids.shape[0], -1)
             model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
 
         if cache_position[0] != 0:
