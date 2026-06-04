@@ -7,8 +7,8 @@ import subprocess
 LOCAL_FLEXBAGEL = Path(__file__).parent.parent.parent / "FlexBagel"
 
 COMMAND = """
-cd /FlexBagel && PYTHONPATH=. torchrun --master_port=29501 --nproc_per_node=4 train/mm_tune_mt.py \
-    --run_id "quilt_qwen2_5-3b-vl-corrected-multiturn" \
+cd /FlexBagel && PYTHONPATH=. torchrun --master_port=29501 --nproc_per_node=4 train/mm_tune.py \
+    --run_id "quilt_qwen2_5-3b-vl-corrected-multiturn-corrected" \
     --model Qwen/Qwen2.5-VL-3B-Instruct \
     --datasets /mnt/quilt/quilt_instruct_w_length_w_path_flatten.jsonl \
     --sample_size 300000 \

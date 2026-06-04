@@ -6,25 +6,49 @@ import subprocess
 
 LOCAL_FLEXBAGEL = Path(__file__).parent.parent.parent / "FlexBagel"
 
+# COMMAND = """
+# cd /FlexBagel && PYTHONPATH=. deepspeed --master_port=29501 --num_gpus=4 train/mm_tune.py \
+#     --run_id "quilt_qwen2_5-3b-vl-test" \
+#     --model Qwen/Qwen2.5-VL-3B-Instruct \
+#     --datasets /mnt/pubmedvision/pubmed_vision_train_w_length_w_path.jsonl \
+#     --sample_size 1500000 \
+#     --num_train_epochs 1 \
+#     --per_device_train_batch_size 16 \
+#     --per_device_eval_batch_size 8 \
+#     --gradient_accumulation_steps 8 \
+#     --logging_steps 10 \
+#     --learning_rate 2e-5 \
+#     --warmup_ratio 0.1 \
+#     --gradient_checkpointing \
+#     --max_seq_length 2048 \
+#     --run_seed 42 \
+#     --run_output_dir "/output/pubmedvision/" \
+#     --save_n_epochs 0.2 \
+#     --dataset_num_proc 6 \
+#     --skip_eval \
+#     --deepspeed "train/ds_config/v0.json"
+# """
+
 COMMAND = """
-cd /FlexBagel && PYTHONPATH=.  torchrun --master_port=29501 --nproc_per_node=4 train/mm_tune.py \
-    --run_id "surg390k_qwen2_5-3b-vl-flex-same-lr-lp-test" \
-    --model micdun/endochat_qwen2_5_vl_moe_2x3b_instruct_untrained \
-    --datasets /mnt/surg390k/total_train_normalized.jsonl \
+cd /FlexBagel && PYTHONPATH=. torchrun --master_port=29501 --nproc_per_node=4 train/mm_tune.py \
+    --run_id "pubmedvision_qwen2_5-3b-vl-instructional-flex" \
+    --model alrope/pubmedvision_qwen2_5-3b-vl-alignment-flex \
+    --datasets /mnt/pubmedvision/pubmed_vision_train_w_length_w_path_instructional.jsonl \
     --train_expert_idx 1 \
     --ddp_find_unused_parameters true \
-    --sample_size 500000 \
-    --num_train_epochs 0.5 \
+    --sample_size 1500000 \
+    --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 8 \
     --logging_steps 10 \
     --learning_rate 2e-5 \
+    --lr_vision 5e-6 \
+    --lr_llm 1e-5 \
+    --lr_connector 5e-6 \
     --warmup_steps 200 \
-    --gradient_checkpointing True \
-    --max_length 4096 \
     --run_seed 42 \
-    --run_output_dir "/output/surg390k/" \
+    --run_output_dir "/output/pubmedvision/" \
     --save_n_epochs 0.1 \
     --dataset_num_proc 6 \
     --skip_eval \
@@ -35,6 +59,28 @@ cd /FlexBagel && PYTHONPATH=.  torchrun --master_port=29501 --nproc_per_node=4 t
     --delete_intermediate_checkpoints false
 """
 
+# COMMAND = """
+# cd /FlexBagel && PYTHONPATH=. python train/mm_tune_mt.py \
+#     --run_id "quilt_qwen2_5-3b-vl-test" \
+#     --model Qwen/Qwen2.5-VL-3B-Instruct \
+#     --datasets /mnt/pubmedvision/filtered_train.jsonl \
+#     --sample_size 1500000 \
+#     --num_train_epochs 1 \
+#     --per_device_train_batch_size 8 \
+#     --per_device_eval_batch_size 4 \
+#     --gradient_accumulation_steps 8 \
+#     --logging_steps 10 \
+#     --learning_rate 2e-5 \
+#     --warmup_ratio 0.1 \
+#     --gradient_checkpointing \
+#     --max_seq_length 2048 \
+#     --run_seed 42 \
+#     --run_output_dir "/output/pubmedvision/" \
+#     --save_n_epochs 1 \
+#     --dataset_num_proc 6 \
+#     --skip_eval \
+#     --deepspeed "train/ds_config/v0.json"
+# """
 
 def run_cli(command: str, use_shell=False):
     if use_shell:
@@ -56,7 +102,7 @@ image = nvidia_image.apt_install("git", "libgl1", "libglib2.0-0") \
         .uv_pip_install("trl==0.22.2", "transformers==4.55.0") \
 
 vol_hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
-vol_data = modal.Volume.from_name("surg390k", create_if_missing=False)
+vol_data = modal.Volume.from_name("pubmedvision", create_if_missing=False)
 vol_output = modal.Volume.from_name("output", create_if_missing=True)
 
 MODEL = "H200"
@@ -64,7 +110,7 @@ NUM_GPUS = 4
 GPU_TYPE = f"{MODEL}:{NUM_GPUS}"
 TIMEOUT_HOURS = 24
 @app.function(image=image, 
-    volumes={"/hf-cache": vol_hf_cache, "/mnt/surg390k": vol_data, "/output": vol_output}, 
+    volumes={"/hf-cache": vol_hf_cache, "/mnt/pubmedvision": vol_data, "/output": vol_output}, 
     secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")], 
     gpu=GPU_TYPE,
     timeout=int(TIMEOUT_HOURS * 60 * 60))
@@ -76,7 +122,6 @@ def train():
     wandb.login(key=os.environ["WANDB_API_KEY"])
     run_cli("pip list")
     run_cli(COMMAND, use_shell=True)
-
 
 @app.local_entrypoint()
 def main():
