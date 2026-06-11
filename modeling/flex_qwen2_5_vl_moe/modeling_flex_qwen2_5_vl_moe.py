@@ -93,7 +93,12 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if True:
+            random_scores = torch.rand_like(routing_weights)
+            selected_experts = torch.argsort(random_scores, dim=-1, descending=True)[:, : self.top_k]
+            routing_weights = routing_weights.new_full(selected_experts.shape, 1.0 / self.top_k)
+        else:
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
