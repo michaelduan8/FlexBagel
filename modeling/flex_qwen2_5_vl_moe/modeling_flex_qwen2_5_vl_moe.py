@@ -271,6 +271,61 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+def sdpa_attention_forward_force_kv_expand(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """
+    SDPA path that explicitly expands GQA/MQA K/V heads before calling
+    torch.nn.functional.scaled_dot_product_attention.
+
+    This avoids passing query/key/value with different num_heads into Intel/XPU
+    fused SDPA kernels, which triggers:
+
+        both fused kernels require query, key and value to have the same num_heads
+    """
+
+    # query: [bsz, q_heads, q_len, head_dim]
+    # key/value: [bsz, kv_heads, kv_len, head_dim]
+    if key.shape[1] != query.shape[1]:
+        if query.shape[1] % key.shape[1] != 0:
+            raise ValueError(
+                f"Cannot expand K/V heads: query heads={query.shape[1]}, key heads={key.shape[1]}"
+            )
+
+        n_rep = query.shape[1] // key.shape[1]
+        key = repeat_kv(key, n_rep)
+        value = repeat_kv(value, n_rep)
+
+    causal_mask = attention_mask
+    if causal_mask is not None:
+        causal_mask = causal_mask[:, :, :, : key.shape[-2]]
+
+    # If a mask is supplied, do not also set is_causal=True.
+    is_causal = causal_mask is None and getattr(module, "is_causal", False) and query.shape[-2] > 1
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=causal_mask,
+        dropout_p=dropout if module.training else 0.0,
+        is_causal=is_causal,
+        scale=scaling,
+    )
+
+    # Match HF attention interface output layout:
+    # [bsz, heads, q_len, head_dim] -> [bsz, q_len, heads, head_dim]
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, None
+
 
 class Flex_Qwen2_5_VLMoeVisionAttention(nn.Module):
     def __init__(self, config: Flex_Qwen2_5_VLMoeVisionConfig) -> None:
@@ -317,7 +372,9 @@ class Flex_Qwen2_5_VLMoeVisionAttention(nn.Module):
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "sdpa":
+            attention_interface = sdpa_attention_forward_force_kv_expand
+        elif self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if self.config._attn_implementation == "flash_attention_2":
@@ -760,7 +817,9 @@ class Flex_Qwen2_5_VLMoeAttention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "sdpa":
+            attention_interface = sdpa_attention_forward_force_kv_expand
+        elif self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
@@ -1724,14 +1783,16 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
 
                 text_positions = model_inputs["position_ids"].unsqueeze(0)
 
-            # Concatenate "text + vision" positions into [4, bs, seq-len]
-            if "position_ids" not in model_inputs:
-                text_positions = torch.arange(input_ids, device=input_ids.device)[None, None, :]
+            if "position_ids" in model_inputs and model_inputs["position_ids"] is not None:
+                text_positions = model_inputs["position_ids"].unsqueeze(0)
             else:
+                ids = model_inputs.get("input_ids", input_ids)
+                batch_size, seq_len = ids.shape
                 text_positions = torch.arange(
-                    model_inputs["input_ids"].shape[1],
-                    device=input_ids.device,
-                ).view(1, 1, -1).expand(1, input_ids.shape[0], -1)
+                    seq_len,
+                    device=ids.device,
+                ).view(1, 1, -1).expand(1, batch_size, -1)
+
             model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
 
         if cache_position[0] != 0:
