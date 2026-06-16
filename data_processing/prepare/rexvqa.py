@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import random
+import re
 import pandas as pd
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
+
+
+OPTION_PREFIX_PATTERN = re.compile(r"^([A-Z])\.\s+(.*)$")
 
 
 def normalize_image_path(image: str, raw_data_dir: Path) -> str:
@@ -40,10 +45,58 @@ def parse_args() -> argparse.Namespace:
         default=os.cpu_count() or 1,
         help="Number of worker processes to use for filtering and mapping.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed for reproducible option shuffling.",
+    )
     return parser.parse_args()
 
 
-def map_row(row: dict[str, Any], raw_data_dir: Path) -> dict[str, Any]:
+def shuffle_options(
+    options: list[str], correct_answer: str, row_id: Any, seed: int | None
+) -> tuple[list[str], str]:
+    parsed_options: list[tuple[str, str]] = []
+    for option in options:
+        match = OPTION_PREFIX_PATTERN.match(option.strip())
+        if match is None:
+            raise ValueError(f"Unexpected option format in row {row_id}: {option!r}")
+        parsed_options.append((match.group(1), match.group(2)))
+
+    original_correct_answer = correct_answer.strip().upper().removesuffix(".")
+    correct_option_text = None
+    for option_letter, option_text in parsed_options:
+        if option_letter == original_correct_answer:
+            correct_option_text = option_text
+            break
+
+    if correct_option_text is None:
+        raise ValueError(
+            f"Correct answer {correct_answer!r} does not match any option in row {row_id}."
+        )
+
+    shuffled_option_texts = [option_text for _, option_text in parsed_options]
+    rng = random.Random(f"{seed}:{row_id}" if seed is not None else None)
+    rng.shuffle(shuffled_option_texts)
+
+    shuffled_options = []
+    updated_correct_answer = None
+    for index, option_text in enumerate(shuffled_option_texts):
+        option_letter = chr(ord("A") + index)
+        shuffled_options.append(f"{option_letter}. {option_text}")
+        if option_text == correct_option_text:
+            updated_correct_answer = option_letter
+
+    if updated_correct_answer is None:
+        raise ValueError(f"Failed to remap correct answer for row {row_id}.")
+
+    return shuffled_options, updated_correct_answer
+
+
+def map_row(
+    row: dict[str, Any], raw_data_dir: Path, seed: int | None
+) -> dict[str, Any]:
     """
     Per row, we remap the conversation and image metadata
     """
@@ -51,7 +104,10 @@ def map_row(row: dict[str, Any], raw_data_dir: Path) -> dict[str, Any]:
         normalize_image_path(img_path, raw_data_dir) for img_path in row["ImagePath"]
     ]
 
-    options = "\n\n".join(row["options"])
+    shuffled_options, updated_correct_answer = shuffle_options(
+        row["options"], row["correct_answer"], row["id"], seed
+    )
+    options = "\n\n".join(shuffled_options)
     query = {
         "role": "user",
         "content": f"{row['question']}\n\n{options}\n\nAnswer with only the letter corresponding to the correct answer choice.",
@@ -59,7 +115,7 @@ def map_row(row: dict[str, Any], raw_data_dir: Path) -> dict[str, Any]:
     }
     answer = {
         "role": "assistant",
-        "content": row["correct_answer"],
+        "content": updated_correct_answer,
         "img_loc": None,
     }
     normalized_conversation = [query, answer]
@@ -84,6 +140,7 @@ def main() -> None:
     output = Path(args.output)
     raw_data_dir = Path(args.raw_data_dir)
     num_workers = max(1, args.num_workers)
+    seed = args.seed
 
     df = pd.read_json(input, orient="index")
     df = df.reset_index().rename(columns={"index": "id"})
@@ -109,7 +166,7 @@ def main() -> None:
     )
 
     # Map each row to the output schema
-    map_fn = partial(map_row, raw_data_dir=raw_data_dir)
+    map_fn = partial(map_row, raw_data_dir=raw_data_dir, seed=seed)
     with mp.Pool(processes=num_workers) as pool:
         records = list(
             tqdm(
