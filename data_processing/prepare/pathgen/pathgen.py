@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset",
-        required=True,
+        default="jamessyx/PathGen-Instruct",
         help="Hugging Face dataset path, e.g. org/dataset_name.",
     )
     parser.add_argument(
@@ -41,7 +41,11 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
     """
     id = row["id"]
     image = os.path.join(raw_data_dir, row["image"])
+<<<<<<< HEAD
     
+=======
+
+>>>>>>> 8b3a61c (edited preprocessing scripts)
     row["orig_images"] = [row["image"]]
     row["images"] = [image]
 
@@ -65,7 +69,11 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
                 raise ValueError(f"Unexpected image tag location in conversation content: {content}")
 
             content = content.replace("<image>", "").strip()
+<<<<<<< HEAD
         
+=======
+
+>>>>>>> 8b3a61c (edited preprocessing scripts)
         parsed_turn = {
             "role": role,
             "content": content,
@@ -73,7 +81,11 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
         }
 
         parsed.append(parsed_turn)
+<<<<<<< HEAD
     
+=======
+
+>>>>>>> 8b3a61c (edited preprocessing scripts)
     assert counter == 1, f"Expected exactly one image tag in conversation content, but found {counter} in row with id {id}."
 
     row["conversation"] = parsed
@@ -98,9 +110,15 @@ def main() -> None:
         num_proc=12,
     )
     mapped_dataset = dataset.map(
+<<<<<<< HEAD
         map_row, 
         fn_kwargs={"raw_data_dir": raw_data_dir},
         remove_columns=dataset.column_names, 
+=======
+        map_row,
+        fn_kwargs={"raw_data_dir": raw_data_dir},
+        remove_columns=dataset.column_names,
+>>>>>>> 8b3a61c (edited preprocessing scripts)
         num_proc=12
     )
 
@@ -115,4 +133,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> 8b3a61c (edited preprocessing scripts)
