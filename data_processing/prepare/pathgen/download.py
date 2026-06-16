@@ -15,13 +15,13 @@ The metadata JSON must be a list of dicts, each with at least:
     - "wsi_id"   : slide filename stem (used to locate the .svs on disk)
     - "position" : [x, y] coordinates for the patch
 
-Progress is written to pipeline_progress.json after every patch so the
-pipeline can resume exactly where it left off after any interruption.
+Completed work is inferred from the output directory: an existing PNG means
+that patch is already done, and a WSI is treated as complete only when all
+expected PNGs from metadata already exist.
 Failed items are logged to pipeline_failures.json for later inspection.
 """
 
 import os
-import sys
 import json
 import shutil
 import logging
@@ -33,7 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from pathlib import Path
-from typing import List, Dict, Set, Any
+from typing import List, Dict, Any
 
 from PIL import Image
 import openslide
@@ -58,39 +58,9 @@ def _tprint(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Progress / failure state
+# Failure state
 # ---------------------------------------------------------------------------
-PROGRESS_FILE = "pipeline_progress.json"
 FAILURES_FILE = "pipeline_failures.json"
-
-
-def load_progress() -> Dict[str, Any]:
-    """
-    Schema
-    ------
-    {
-      "completed_batches": ["batch_0000", ...],
-      "processed_patches": ["WSI_id_x_y", ...],   # per-patch resume
-      "total_processed": 0,
-      "total_skipped":   0,
-      "total_failed":    0,
-      "batch_stats": {
-          "batch_0000": {"processed": N, "skipped": N, "failed": N,
-                         "elapsed_s": N}
-      }
-    }
-    """
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            return json.load(f)
-    return {
-        "completed_batches": [],
-        "processed_patches": [],
-        "total_processed": 0,
-        "total_skipped": 0,
-        "total_failed": 0,
-        "batch_stats": {},
-    }
 
 
 def _atomic_save(path: str, obj: Any) -> None:
@@ -99,10 +69,6 @@ def _atomic_save(path: str, obj: Any) -> None:
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
-
-
-def save_progress(progress: Dict[str, Any]) -> None:
-    _atomic_save(PROGRESS_FILE, progress)
 
 
 def load_failures() -> List[Dict[str, Any]]:
@@ -128,6 +94,37 @@ def build_manifest(file_ids: List[str], manifest_path: str) -> None:
         for fid in file_ids:
             f.write(f"{fid}\t\t\t\t\n")
     log.info("Manifest: %s  (%d files)", manifest_path, len(file_ids))
+
+
+def _file_id_is_complete_in_output(
+    items: List[Dict[str, Any]],
+    output_dir: str,
+) -> bool:
+    return all(os.path.exists(_output_patch_path(output_dir, item)) for item in items)
+
+
+def _output_patch_path(output_dir: str, item: Dict[str, Any]) -> str:
+    wsi_id = item["wsi_id"]
+    position = item["position"]
+    return os.path.join(output_dir, wsi_id, f"{position[0]}_{position[1]}.png")
+
+
+def _find_wsi_path(wsi_dir: str, wsi_id: str) -> str | None:
+    return next(
+        (
+            os.path.join(wsi_dir, f"{wsi_id}{ext}")
+            for ext in WSI_EXTS
+            if os.path.exists(os.path.join(wsi_dir, f"{wsi_id}{ext}"))
+        ),
+        None,
+    )
+
+
+def _file_id_has_downloaded_wsi(
+    items: List[Dict[str, Any]],
+    wsi_dir: str,
+) -> bool:
+    return any(_find_wsi_path(wsi_dir, item["wsi_id"]) for item in items)
 
 
 def download_batch(
@@ -161,11 +158,12 @@ def download_batch(
     result = subprocess.run(cmd)
     os.unlink(manifest_path)
 
+    _flatten_gdc_download(wsi_dir)
+
     if result.returncode != 0:
         log.error("gdc-client exited %d", result.returncode)
         return False
 
-    _flatten_gdc_download(wsi_dir)
     return True
 
 
@@ -215,8 +213,6 @@ def process_batch_items(
     items: List[Dict[str, Any]],
     wsi_dir: str,
     output_dir: str,
-    already_done: Set[str],
-    progress: Dict[str, Any],
     batch_label: str,
     max_workers: int = 4,
 ) -> Dict[str, int]:
@@ -238,32 +234,20 @@ def process_batch_items(
         Returns (status, failure_record_or_None, output_patch_or_None).
         All updates to shared state are done by the caller under `lock`.
         """
-        wsi_id   = item["wsi_id"]
+        wsi_id = item["wsi_id"]
         position = item["position"]
-        output_patch = os.path.join(
-            output_dir, wsi_id, f"{position[0]}_{position[1]}.png"
-        )
+        output_patch = _output_patch_path(output_dir, item)
         os.makedirs(os.path.dirname(output_patch), exist_ok=True)
 
-        # ── already done (mid-batch resume) ──────────────────────────
-        if output_patch in already_done:
+        # ── already done ─────────────────────────────────────────────
+        if os.path.exists(output_patch):
             return "skipped", None, None
 
         # ── locate WSI ────────────────────────────────────────────────
-        wsi_path = next(
-            (
-                os.path.join(wsi_dir, f"{wsi_id}{ext}")
-                for ext in WSI_EXTS
-                if os.path.exists(os.path.join(wsi_dir, f"{wsi_id}{ext}"))
-            ),
-            None,
-        )
+        wsi_path = _find_wsi_path(wsi_dir, wsi_id)
         if wsi_path is None:
-            log.warning("WSI not found: %s", wsi_id)
-            return "failed", {
-                "batch": batch_label, "wsi_id": wsi_id,
-                "position": position, "reason": "wsi_not_found",
-            }, None
+            log.warning("WSI not available for patch extraction: %s", wsi_id)
+            return "skipped", None, None
 
         # ── extract (OpenSlide releases the GIL here) ─────────────────
         patch = extract_patch_from_wsi(wsi_path, position, PATCH_SIZE)
@@ -311,12 +295,7 @@ def process_batch_items(
                 with lock:
                     counts[status] += 1
 
-                    if status == "processed":
-                        progress["total_processed"] += 1
-                        progress["processed_patches"].append(output_patch)
-                        save_progress(progress)   # atomic write, safe here
-
-                    elif status == "failed" and failure:
+                    if status == "failed" and failure:
                         append_failure(failure)   # also does atomic write
 
                 pbar.update(1)
@@ -359,7 +338,6 @@ def _print_startup_summary(
     total_records: int,
     total_file_ids: int,
     n_batches: int,
-    n_done: int,
     batch_size: int,
     max_workers: int,
 ) -> None:
@@ -372,8 +350,6 @@ def _print_startup_summary(
         f"  Unique file IDs        : {total_file_ids:,}",
         f"  Batch size             : {batch_size}",
         f"  Total batches          : {n_batches}",
-        f"  Already completed      : {n_done}",
-        f"  Remaining              : {n_batches - n_done}",
         f"  Patch workers          : {max_workers}",
         "═" * w, "",
     ]
@@ -387,7 +363,7 @@ def _print_batch_summary(
     n_batches: int,
     counts: Dict[str, int],
     elapsed: float,
-    progress: Dict[str, Any],
+    totals: Dict[str, int],
 ) -> None:
     lines = [
         "",
@@ -397,8 +373,9 @@ def _print_batch_summary(
         f"     Failed    : {counts['failed']:,}",
         f"     Elapsed   : {_fmt(elapsed)}",
         f"     ─ Cumulative ─",
-        f"     Processed : {progress['total_processed']:,}",
-        f"     Failed    : {progress['total_failed']:,}",
+        f"     Processed : {totals['processed']:,}",
+        f"     Skipped   : {totals['skipped']:,}",
+        f"     Failed    : {totals['failed']:,}",
         "",
     ]
     for line in lines:
@@ -441,16 +418,12 @@ def run_pipeline(
         for i in range(0, len(unique_file_ids), batch_size)
     ]
 
-    # ── load prior progress ───────────────────────────────────────────────
-    progress          = load_progress()
-    completed_batches = set(progress["completed_batches"])
-    done_patches: Set[str] = set(progress["processed_patches"])
+    totals = {"processed": 0, "skipped": 0, "failed": 0}
 
     _print_startup_summary(
         total_records=len(data),
         total_file_ids=len(unique_file_ids),
         n_batches=len(batches),
-        n_done=len(completed_batches),
         batch_size=batch_size,
         max_workers=max_workers,
     )
@@ -460,7 +433,6 @@ def run_pipeline(
     # outer bar: one tick per batch
     with tqdm(
         total=len(batches),
-        initial=len(completed_batches),
         desc="Overall batches",
         unit="batch",
         dynamic_ncols=True,
@@ -470,9 +442,6 @@ def run_pipeline(
         for batch_idx, batch_file_ids in enumerate(batches):
             batch_label = f"batch_{batch_idx:04d}"
 
-            if batch_label in completed_batches:
-                continue  # already counted in `initial`
-
             batch_bar.set_description(f"Batches  [{batch_label}]")
             _tprint(
                 f"\n── {batch_label}  "
@@ -480,30 +449,67 @@ def run_pipeline(
                 f"{len(batch_file_ids)} files ──"
             )
 
+            batch_file_ids_to_download = [
+                fid
+                for fid in batch_file_ids
+                if not _file_id_is_complete_in_output(file_id_to_items[fid], output_dir)
+            ]
+
+            completed_wsi_count = len(batch_file_ids) - len(batch_file_ids_to_download)
+            if completed_wsi_count:
+                _tprint(
+                    f"  ↷  Skipping {completed_wsi_count} fully completed file(s)"
+                )
+
             if dry_run:
-                _tprint(f"  [DRY RUN] Would download + process {batch_label}")
+                _tprint(
+                    f"  [DRY RUN] Would download + process {batch_label} "
+                    f"({len(batch_file_ids_to_download)} downloads)"
+                )
                 batch_bar.update(1)
                 continue
 
             batch_start = time.time()
 
             # 1. Download ──────────────────────────────────────────────────
-            _tprint(f"  ↓  Downloading {len(batch_file_ids)} WSIs …")
-            ok = download_batch(
-                file_ids=batch_file_ids,
-                wsi_dir=wsi_dir,
-                gdc_token=gdc_token,
-                n_processes=n_processes,
-            )
-            if not ok:
-                _tprint(f"  ✗  Download failed for {batch_label} – skipping")
-                append_failure({
-                    "batch": batch_label,
-                    "reason": "download_failed",
-                    "file_ids": batch_file_ids,
-                })
-                batch_bar.update(1)
-                continue
+            download_had_failures = False
+            file_ids_to_process = batch_file_ids_to_download
+
+            if batch_file_ids_to_download:
+                _tprint(f"  ↓  Downloading {len(batch_file_ids_to_download)} WSIs …")
+                ok = download_batch(
+                    file_ids=batch_file_ids_to_download,
+                    wsi_dir=wsi_dir,
+                    gdc_token=gdc_token,
+                    n_processes=n_processes,
+                )
+                if not ok:
+                    download_had_failures = True
+                    file_ids_to_process = [
+                        fid
+                        for fid in batch_file_ids_to_download
+                        if _file_id_has_downloaded_wsi(file_id_to_items[fid], wsi_dir)
+                    ]
+                    append_failure({
+                        "batch": batch_label,
+                        "reason": "download_failed",
+                        "file_ids": batch_file_ids_to_download,
+                    })
+                    if not file_ids_to_process:
+                        _tprint(
+                            f"  ✗  Download failed for {batch_label}; no WSIs available to process"
+                        )
+                        delete_batch_wsis(wsi_dir)
+                        batch_bar.update(1)
+                        continue
+
+                    _tprint(
+                        "  !  Download completed with failures; proceeding with "
+                        f"{len(file_ids_to_process)}/{len(batch_file_ids_to_download)} "
+                        "available WSIs"
+                    )
+            else:
+                _tprint("  ↷  No downloads needed for this batch")
 
             # 2. Process ───────────────────────────────────────────────────
             batch_items: List[Dict[str, Any]] = []
@@ -514,29 +520,17 @@ def run_pipeline(
                 items=batch_items,
                 wsi_dir=wsi_dir,
                 output_dir=output_dir,
-                already_done=done_patches,
-                progress=progress,
                 batch_label=batch_label,
                 max_workers=max_workers,
             )
-            # absorb newly done patches into the master set
-            done_patches.update(progress["processed_patches"])
 
             # 3. Delete WSIs ───────────────────────────────────────────────
             delete_batch_wsis(wsi_dir)
 
-            # 4. Persist batch completion ───────────────────────────────────
+            # 4. Update summary totals ─────────────────────────────────────
             elapsed = time.time() - batch_start
-            progress["completed_batches"].append(batch_label)
-            progress["total_skipped"] += counts["skipped"]
-            progress["total_failed"]  += counts["failed"]
-            progress["batch_stats"][batch_label] = {
-                "processed": counts["processed"],
-                "skipped":   counts["skipped"],
-                "failed":    counts["failed"],
-                "elapsed_s": round(elapsed, 1),
-            }
-            save_progress(progress)
+            for key in totals:
+                totals[key] += counts[key]
 
             _print_batch_summary(
                 batch_label=batch_label,
@@ -544,8 +538,12 @@ def run_pipeline(
                 n_batches=len(batches),
                 counts=counts,
                 elapsed=elapsed,
-                progress=progress,
+                totals=totals,
             )
+            if download_had_failures:
+                _tprint(
+                    "  !  Batch left incomplete so missing downloads can retry on the next run"
+                )
             batch_bar.update(1)
 
             if batch_pause_s > 0 and batch_idx < len(batches) - 1:
@@ -559,12 +557,12 @@ def run_pipeline(
         "", "═" * w,
         "  Pipeline complete",
         "═" * w,
-        f"  Total processed : {progress['total_processed']:,}",
-        f"  Total skipped   : {progress['total_skipped']:,}",
-        f"  Total failed    : {progress['total_failed']:,}",
+        f"  Total processed : {totals['processed']:,}",
+        f"  Total skipped   : {totals['skipped']:,}",
+        f"  Total failed    : {totals['failed']:,}",
         f"  Wall time       : {_fmt(wall)}",
     ]
-    if progress["total_failed"]:
+    if totals["failed"]:
         lines.append(f"  Failures logged : {FAILURES_FILE}")
     lines += ["═" * w, ""]
     for line in lines:
@@ -572,9 +570,9 @@ def run_pipeline(
 
     log.info(
         "Done. ok=%d skip=%d fail=%d elapsed=%s",
-        progress["total_processed"],
-        progress["total_skipped"],
-        progress["total_failed"],
+        totals["processed"],
+        totals["skipped"],
+        totals["failed"],
         _fmt(wall),
     )
 
