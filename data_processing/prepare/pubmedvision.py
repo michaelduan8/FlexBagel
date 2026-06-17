@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         description="Load a JSON file and convert each row to one JSONL line."
     )
     parser.add_argument("--input1", required=True, help="Path to input JSON file.")
-    parser.add_argument("--input2", required=True, help="Path to input JSON file.")
+    parser.add_argument("--input2", required=False, default=None, help="Path to input JSON file.")
     parser.add_argument("--output", required=True, help="Path to output JSONL file.")
     parser.add_argument(
         "--raw_data_dir",
@@ -79,15 +79,16 @@ def main() -> None:
     args = parse_args()
 
     input1 = Path(args.input1)
-    input2 = Path(args.input2)
+    input2 = Path(args.input2) if args.input2 is not None else None
     output = Path(args.output)
     raw_data_dir = Path(args.raw_data_dir)
 
     dataset = load_dataset("json", data_files=str(input1), split="train")
-    dataset2 = load_dataset("json", data_files=str(input2), split="train")
-    dataset = concatenate_datasets([dataset, dataset2])
+    if input2 is not None:
+        dataset2 = load_dataset("json", data_files=str(input2), split="train")
+        dataset = concatenate_datasets([dataset, dataset2])
     total = len(dataset)
-    print(f"Loaded {total} rows from {input1} and {input2}.")
+    print(f"Loaded {total} rows from {input1} and {input2 if input2 is not None else 'None'}.")
 
     # Filter rows where all images exist
     dataset = dataset.map(

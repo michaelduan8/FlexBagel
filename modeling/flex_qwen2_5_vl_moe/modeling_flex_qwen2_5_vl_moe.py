@@ -75,14 +75,33 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        if hidden_states.ndim == 2:
+            original_ndim = 2
+            sequence_length, hidden_dim = hidden_states.shape
+            batch_size = 1
+            hidden_states = hidden_states.unsqueeze(0)
+
+        elif hidden_states.ndim == 3:
+            original_ndim = 3
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        else:
+            raise ValueError(f"Expected 2D or 3D hidden_states, got {hidden_states.shape}")
+        # batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_dim)  # changed from view -> reshape
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
+        if False:
+            random_scores = torch.rand_like(routing_weights)
+            selected_experts = torch.argsort(random_scores, dim=-1, descending=True)[:, : self.top_k]
+            routing_weights = routing_weights.new_full(selected_experts.shape, 1.0 / self.top_k)
+        else:
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.top_k == 1:
+            routing_weights = torch.ones_like(routing_weights)
+        elif self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -98,8 +117,10 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         # Loop over all available experts in the model and perform the computation on each expert
         expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hitted:
+            expert_idx = expert_idx.item()  # added
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+
+            idx, top_x = torch.where(expert_mask[expert_idx])  # removed .squeeze(0)
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
@@ -118,6 +139,10 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states # + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+        if original_ndim == 2:
+            final_hidden_states = final_hidden_states.squeeze(0)
+
         return final_hidden_states, router_logits
 
 
@@ -253,6 +278,61 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+def sdpa_attention_forward_force_kv_expand(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """
+    SDPA path that explicitly expands GQA/MQA K/V heads before calling
+    torch.nn.functional.scaled_dot_product_attention.
+
+    This avoids passing query/key/value with different num_heads into Intel/XPU
+    fused SDPA kernels, which triggers:
+
+        both fused kernels require query, key and value to have the same num_heads
+    """
+
+    # query: [bsz, q_heads, q_len, head_dim]
+    # key/value: [bsz, kv_heads, kv_len, head_dim]
+    if key.shape[1] != query.shape[1]:
+        if query.shape[1] % key.shape[1] != 0:
+            raise ValueError(
+                f"Cannot expand K/V heads: query heads={query.shape[1]}, key heads={key.shape[1]}"
+            )
+
+        n_rep = query.shape[1] // key.shape[1]
+        key = repeat_kv(key, n_rep)
+        value = repeat_kv(value, n_rep)
+
+    causal_mask = attention_mask
+    if causal_mask is not None:
+        causal_mask = causal_mask[:, :, :, : key.shape[-2]]
+
+    # If a mask is supplied, do not also set is_causal=True.
+    is_causal = causal_mask is None and getattr(module, "is_causal", False) and query.shape[-2] > 1
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=causal_mask,
+        dropout_p=dropout if module.training else 0.0,
+        is_causal=is_causal,
+        scale=scaling,
+    )
+
+    # Match HF attention interface output layout:
+    # [bsz, heads, q_len, head_dim] -> [bsz, q_len, heads, head_dim]
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, None
+
 
 class Flex_Qwen2_5_VLMoeVisionAttention(nn.Module):
     def __init__(self, config: Flex_Qwen2_5_VLMoeVisionConfig) -> None:
@@ -299,7 +379,9 @@ class Flex_Qwen2_5_VLMoeVisionAttention(nn.Module):
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "sdpa":
+            attention_interface = sdpa_attention_forward_force_kv_expand
+        elif self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if self.config._attn_implementation == "flash_attention_2":
@@ -742,7 +824,9 @@ class Flex_Qwen2_5_VLMoeAttention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "sdpa":
+            attention_interface = sdpa_attention_forward_force_kv_expand
+        elif self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
@@ -1428,7 +1512,7 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            output_router_logits=outputs.output_router_logits,
+            router_logits=outputs.router_logits,
             rope_deltas=self.rope_deltas,
         )
         return output if return_dict else output.to_tuple()
@@ -1462,7 +1546,7 @@ class Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(ModelOutput):
     past_key_values: Optional[list[torch.FloatTensor]] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
-    output_router_logits: Optional[tuple[torch.FloatTensor]] = None
+    router_logits: Optional[tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
 
 
@@ -1689,17 +1773,33 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
                 self.model.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             elif "position_ids" in model_inputs:
-                position_ids = model_inputs["position_ids"][None, ...]
-                delta = self.model.rope_deltas
-                delta = delta.repeat_interleave(position_ids.shape[1] // delta.shape[0], dim=0)
-                vision_positions = position_ids + delta.expand_as(position_ids)
-                vision_positions = vision_positions.expand(3, vision_positions.shape[1], -1)
+                batch_size, seq_len = model_inputs["input_ids"].shape
 
-            # Concatenate "text + vision" positions into [4, bs, seq-len]
-            if "position_ids" not in model_inputs:
-                text_positions = torch.arange(input_ids, device=input_ids.device)[None, None, :]
+                delta = self.model.rope_deltas.to(input_ids.device)
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+
+                vision_positions = torch.arange(seq_len, device=input_ids.device)
+                vision_positions = vision_positions.view(1, -1).expand(batch_size, -1)
+
+                if cache_position is not None:
+                    vision_positions = vision_positions + cache_position[0] + delta
+                else:
+                    vision_positions = vision_positions + delta
+
+                vision_positions = vision_positions.unsqueeze(0).expand(3, -1, -1)
+
+                text_positions = model_inputs["position_ids"].unsqueeze(0)
+
+            if "position_ids" in model_inputs and model_inputs["position_ids"] is not None:
+                text_positions = model_inputs["position_ids"].unsqueeze(0)
             else:
-                text_positions = model_inputs["position_ids"][None, ...]
+                ids = model_inputs.get("input_ids", input_ids)
+                batch_size, seq_len = ids.shape
+                text_positions = torch.arange(
+                    seq_len,
+                    device=ids.device,
+                ).view(1, 1, -1).expand(1, batch_size, -1)
+
             model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
 
         if cache_position[0] != 0:

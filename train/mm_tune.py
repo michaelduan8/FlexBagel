@@ -17,8 +17,28 @@ from datetime import datetime
 from dotenv import load_dotenv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image as PILImage
-from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor
+from PIL import ImageFile
+import struct
+from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from trl import SFTTrainer, SFTConfig
+from modeling.flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration
+from torch.optim import AdamW
+from safetensors.torch import load_file, save_file
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+_ORIG_GETEXIF = PILImage.Image.getexif
+
+def safe_getexif(self):
+    try:
+        return _ORIG_GETEXIF(self)
+    except (SyntaxError, OSError, ValueError, struct.error) as e:
+        # Broken EXIF/TIFF metadata. Ignore EXIF orientation instead of crashing.
+        filename = getattr(self, "filename", None)
+        print(f"[WARN] Ignoring broken EXIF for image: {filename}, error={repr(e)}")
+        return {}
+
+PILImage.Image.getexif = safe_getexif
 
 @dataclass
 class SFTArgs:
@@ -35,6 +55,14 @@ class SFTArgs:
         default=None,
         metadata={"help": "Explicit checkpoint path to resume from. Overrides auto_resume."}
     )
+    fix_resume_checkpoint_keys: bool = field(
+        default=True,
+        metadata={"help": "Before resuming, create/use a runtime-key checkpoint with Qwen2.5-VL parameter keys remapped to the current model wrapper."}
+    )
+    runtime_key_checkpoint_suffix: str = field(
+        default="-runtime-key",
+        metadata={"help": "Suffix for the derived checkpoint directory used after checkpoint key remapping."}
+    )
     delete_intermediate_checkpoints: bool = field(
         default=True,
         metadata={"help": "Delete checkpoint-* directories after successful training completion."}
@@ -47,6 +75,9 @@ class SFTArgs:
     )
     eval_n_epochs: float = field(default=2.0, metadata={"help": "Evaluate every N epochs"})
     save_n_epochs: float = field(default=1.0, metadata={"help": "Save a checkpoint every N epochs"})
+    lr_vision: float = field(default=None, metadata={"help": "Learning rate for vision tower"})
+    lr_llm: float = field(default=None, metadata={"help": "Learning rate for LLM decoder"})
+    lr_connector: float = field(default=None, metadata={"help": "Learning rate for VL connector MLP"})
     filter_by_id: list[str] = field(
         default=None,
         metadata={"help": "Only keep rows whose prompt_id contains at least one of these substrings. If None, no filtering is applied."}
@@ -81,6 +112,89 @@ class SFTArgs:
         metadata={"help": "Target modules for LoRA. If None, uses default for the model architecture."}
     )
     merge_and_save: bool = field(default=False, metadata={"help": "Merge LoRA weights into base model and save full model"})
+
+
+def build_vlm_optimizer(
+    model,
+    sft_config,
+    lr_vision=None,
+    lr_llm=None,
+    lr_connector=None,
+):
+    """
+    Different LR for:
+      - vision tower:        visual.*
+      - LLM decoder:         language_model.*
+      - VL connector MLP:    visual.merger.mlp.*
+
+    Other optimizer args come from sft_config.
+    """
+
+    # Use sft_config.learning_rate as default if not specified
+    lr_vision = sft_config.learning_rate if lr_vision is None else lr_vision
+    lr_llm = sft_config.learning_rate if lr_llm is None else lr_llm
+    lr_connector = sft_config.learning_rate if lr_connector is None else lr_connector
+
+    vision_params = []
+    llm_params = []
+    connector_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Check connector first because it is inside visual
+        if "visual.merger.mlp." in name:
+            connector_params.append(param)
+
+        elif "visual." in name:
+            vision_params.append(param)
+
+        elif "language_model." in name:
+            llm_params.append(param)
+
+        else:
+            other_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": vision_params,
+            "lr": lr_vision,
+            "weight_decay": sft_config.weight_decay,
+            "name": "vision_tower",
+        },
+        {
+            "params": llm_params,
+            "lr": lr_llm,
+            "weight_decay": sft_config.weight_decay,
+            "name": "llm_decoder",
+        },
+        {
+            "params": connector_params,
+            "lr": lr_connector,
+            "weight_decay": sft_config.weight_decay,
+            "name": "vl_connector_mlp",
+        },
+    ]
+
+    if len(other_params) > 0:
+        optimizer_grouped_parameters.append(
+            {
+                "params": other_params,
+                "lr": lr_llm,
+                "weight_decay": sft_config.weight_decay,
+                "name": "other",
+            }
+        )
+
+    optimizer = AdamW(
+        optimizer_grouped_parameters,
+        betas=(sft_config.adam_beta1, sft_config.adam_beta2),
+        eps=sft_config.adam_epsilon,
+    )
+
+    return optimizer
 
 
 def measure_vlm_lengths(dataset, processor, n=200):
@@ -152,6 +266,12 @@ def measure_vlm_lengths(dataset, processor, n=200):
 def register_local_architectures():
     print("Registering local architectures...")
 
+    # Register configs to AutoConfig
+    AutoConfig.register("flex_qwen2_5_vl_moe", Flex_Qwen2_5_VLMoeConfig)
+
+    # Register models to AutoModelForCausalLM
+    AutoModelForImageTextToText.register(Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration)
+
 
 def preprocess_dataset(dataset):
     """Convert dataset to conversational prompt-completion format for SFTTrainer."""
@@ -188,7 +308,8 @@ def preprocess_dataset(dataset):
         return item
 
     def convert_row(item):
-        assert "images" in item and "conversation" in item and "id" in item
+        image_key = "images"
+        assert image_key in item and "conversation" in item and "id" in item
 
         # Convert bytes → PIL here, no multiprocessing so no pickling issues
         # images = []
@@ -223,19 +344,32 @@ def preprocess_dataset(dataset):
         id = item["id"]
         conversation = item["conversation"]
         assert conversation[-1]["role"] == "assistant"
-        assert len(conversation) <= 3
+        # assert len(conversation) <= 3
 
-        images = item["images"]
+        images = item[image_key]
 
         prompt = []
-        # TODO: not sure how to handle multiturn data
+        used_image = False
+
         for turn in conversation[:-1]:
-            if turn["role"] == "user" and turn["img_loc"] is not None:
-                content = [{"type": "text", "text": turn["content"]}]
-                #content = [{"type": "image"} for _ in rgb_bytes] + content if turn["img_loc"] == "before" else content + [{"type": "image"} for _ in rgb_bytes]
-                content = [{"type": "image"} for _ in images] + content if turn["img_loc"] == "before" else content + [{"type": "image"} for _ in images]
-            else:
-                content = [{"type": "text", "text": turn["content"]}]
+            content = [{"type": "text", "text": turn["content"]}]
+
+            # Minimal multi-turn support:
+            # If a user turn has img_loc, attach the top-level images only once.
+            # This avoids duplicating image placeholders across multiple user turns.
+            if (
+                turn["role"] == "user"
+                and turn.get("img_loc") is not None
+                and images
+                and not used_image
+            ):
+                image_content = [{"type": "image"} for _ in images]
+                if turn["img_loc"] == "before":
+                    content = image_content + content
+                else:
+                    content = content + image_content
+                used_image = True
+
             prompt.append({"role": turn["role"], "content": content})
 
         return {
@@ -401,64 +535,146 @@ class WandbLoggingCallback(TrainerCallback):
     #     return ["q_proj", "v_proj"]
 
 
-# def print_trainable_parameters(model):
-    # """Print the number of trainable parameters in the model."""
-    # trainable_params = 0
-    # all_param = 0
-    # for _, param in model.named_parameters():
-    #     all_param += param.numel()
-    #     if param.requires_grad:
-    #         trainable_params += param.numel()
+def print_trainable_parameters(model):
+    """Print the number of trainable parameters in the model."""
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
 
-    # trainable_pct = 100 * trainable_params / all_param
-    # print(f"Trainable params: {trainable_params:,} || All params: {all_param:,} || Trainable%: {trainable_pct:.4f}")
-    # return trainable_params, all_param, trainable_pct
-
-
-# def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False):
-    # """
-    # Freeze all parameters except the target expert's FFN and its router row.
-
-    # If use_lora=True, all base weights are frozen here and LoRA adapters will be
-    # inserted on top of the target expert's modules afterward — so we don't need to
-    # unfreeze the expert FFN weights themselves (the LoRA adapters are trainable by
-    # default).
-
-    # If use_lora=False, the target expert's FFN weights are unfrozen for full
-    # fine-tuning.
-
-    # The router gate row for expert_idx is kept trainable. Gradient masking for the
-    # router is handled by ExpertSFTTrainer.training_step, which zeroes out all
-    # router gradient rows except expert_idx after each backward pass, before the
-    # optimizer step. This is cleaner than a backward hook because it avoids polluting
-    # Adam's momentum/variance buffers for the frozen rows.
-
-    # Args:
-    #     model: The MoE model to modify.
-    #     expert_idx: Index of the expert to train.
-    #     use_lora: Whether LoRA will be applied after this call.
-    # """
-    # for name, param in model.named_parameters():
-    #     if not use_lora and f".mlp.experts.{expert_idx}." in name:
-    #         param.requires_grad = True
-    #         print(f"[trainable] {name}")
-    #     elif ".mlp.gate.weight" in name:
-    #         # Unfreeze the whole gate; ExpertSFTTrainer masks gradients for all
-    #         # rows except expert_idx after each backward pass.
-    #         param.requires_grad = True
-    #         print(f"[trainable-router] {name}")
-    #     else:
-    #         param.requires_grad = False
+    trainable_pct = 100 * trainable_params / all_param
+    print(f"Trainable params: {trainable_params:,} || All params: {all_param:,} || Trainable%: {trainable_pct:.4f}")
+    return trainable_params, all_param, trainable_pct
 
 
-# def freeze_all_except_router(model):
-    # """Freeze all parameters except MoE router gate weights."""
-    # for name, param in model.named_parameters():
-    #     if ".mlp.gate.weight" in name:
-    #         param.requires_grad = True
-    #         print(f"[trainable-router] {name}")
-    #     else:
-    #         param.requires_grad = False
+def freeze_all_except_expert(model, expert_idx: int, use_lora: bool = False, verbose: bool = True):
+    """
+    Freeze all parameters except the target expert and router gates in BOTH:
+      1. decoder MoE blocks:      model.language_model.layers.*.mlp
+      2. vision tower MoE blocks: model.visual.blocks.*.mlp
+
+    If use_lora=True:
+        Base expert weights stay frozen. LoRA adapters should be inserted after
+        this call and will be trainable by default.
+
+    If use_lora=False:
+        The target expert FFN weights are unfrozen for full fine-tuning.
+
+    Router gates:
+        The full gate.weight is unfrozen because PyTorch cannot set
+        requires_grad=True for only one row. Your trainer should mask all router
+        gradient rows except expert_idx before optimizer.step().
+    """
+
+    def is_sparse_moe_block(module):
+        return (
+            hasattr(module, "experts")
+            and hasattr(module, "gate")
+            and hasattr(module.gate, "weight")
+        )
+
+    def get_scope(module_name: str) -> str:
+        parts = module_name.split(".")
+
+        # Works when called on Flex_Qwen2_5_VLMoeForConditionalGeneration
+        # or on the inner Flex_Qwen2_5_VLMoeModel.
+        if "visual" in parts and "blocks" in parts:
+            return "vision"
+        if "language_model" in parts and "layers" in parts:
+            return "decoder"
+
+        # Works if you pass model.visual or model.language_model directly.
+        if len(parts) > 0 and parts[0] == "blocks":
+            return "vision"
+        if len(parts) > 0 and parts[0] == "layers":
+            return "decoder"
+
+        return "other"
+
+    # 1. Freeze everything first.
+    for _, param in model.named_parameters():
+        param.requires_grad = False
+
+    num_decoder_moe = 0
+    num_vision_moe = 0
+    num_other_moe = 0
+    trainable_names = []
+
+    # 2. Unfreeze target expert + router gate in every SparseMoeBlock.
+    for module_name, module in model.named_modules():
+        if not is_sparse_moe_block(module):
+            continue
+
+        scope = get_scope(module_name)
+
+        if expert_idx < 0 or expert_idx >= len(module.experts):
+            raise ValueError(
+                f"expert_idx={expert_idx} is invalid for {module_name}; "
+                f"this block has {len(module.experts)} experts."
+            )
+
+        if scope == "decoder":
+            num_decoder_moe += 1
+        elif scope == "vision":
+            num_vision_moe += 1
+        else:
+            num_other_moe += 1
+
+        # Full fine-tuning case: unfreeze the target expert FFN.
+        # LoRA case: keep base expert frozen; LoRA adapters are added later.
+        if not use_lora:
+            target_expert = module.experts[expert_idx]
+            for pname, param in target_expert.named_parameters():
+                param.requires_grad = True
+                full_name = f"{module_name}.experts.{expert_idx}.{pname}".lstrip(".")
+                trainable_names.append(full_name)
+                if verbose:
+                    print(f"[trainable-{scope}-expert] {full_name}")
+
+        # Router: unfreeze whole gate.weight.
+        # Your trainer masks rows except expert_idx after backward.
+        for pname, param in module.gate.named_parameters():
+            param.requires_grad = True
+            full_name = f"{module_name}.gate.{pname}".lstrip(".")
+            trainable_names.append(full_name)
+            if verbose:
+                print(f"[trainable-{scope}-router] {full_name}")
+
+    if num_decoder_moe + num_vision_moe + num_other_moe == 0:
+        raise RuntimeError(
+            "No SparseMoeBlock found. Check that you passed the full VLM model, "
+            "or that the model actually has num_experts > 0."
+        )
+
+    if verbose:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+
+        print(
+            "[freeze_all_except_expert] "
+            f"decoder MoE blocks={num_decoder_moe}, "
+            f"vision MoE blocks={num_vision_moe}, "
+            f"other MoE blocks={num_other_moe}"
+        )
+        print(
+            "[freeze_all_except_expert] "
+            f"trainable params={trainable_params:,} / {total_params:,} "
+            f"({100 * trainable_params / total_params:.4f}%)"
+        )
+
+    return trainable_names
+
+
+def freeze_all_except_router(model):
+    """Freeze all parameters except MoE router gate weights."""
+    for name, param in model.named_parameters():
+        if ".mlp.gate.weight" in name:
+            param.requires_grad = True
+            print(f"[trainable-router] {name}")
+        else:
+            param.requires_grad = False
 
 
 # def unfreeze_attention_layers(model):
@@ -510,31 +726,31 @@ class WandbLoggingCallback(TrainerCallback):
     # print(f"Unfroze embedding parameters: {trainable_count}")
 
 
-# class ExpertSFTTrainer(SFTTrainer):
-    # """
-    # SFTTrainer subclass that zeroes out router gate gradients for all experts
-    # except the target one, after backward but before the optimizer step.
+class ExpertSFTTrainer(SFTTrainer):
+    """
+    SFTTrainer subclass that zeroes out router gate gradients for all experts
+    except the target one, after backward but before the optimizer step.
 
-    # This is preferable to a backward hook because the gradient zeroing happens
-    # at a well-defined point in the training loop, and Adam's momentum/variance
-    # buffers for the frozen rows are never updated with non-zero values.
-    # """
-    # def __init__(self, *args, expert_idx: int = None, **kwargs):
-    #     super().__init__(*args, **kwargs)
-    #     self.expert_idx = expert_idx
+    This is preferable to a backward hook because the gradient zeroing happens
+    at a well-defined point in the training loop, and Adam's momentum/variance
+    buffers for the frozen rows are never updated with non-zero values.
+    """
+    def __init__(self, *args, expert_idx: int = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.expert_idx = expert_idx
 
-    # def training_step(self, model, inputs, num_items_in_batch=None):
-    #     loss = super().training_step(model, inputs, num_items_in_batch)
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch)
 
-    #     if self.expert_idx is not None:
-    #         for name, param in model.named_parameters():
-    #             if ".mlp.gate.weight" in name and param.grad is not None:
-    #                 with torch.no_grad():
-    #                     mask = torch.zeros_like(param.grad)
-    #                     mask[self.expert_idx] = 1.0
-    #                     param.grad *= mask
+        if self.expert_idx is not None:
+            for name, param in model.named_parameters():
+                if ".mlp.gate.weight" in name and param.grad is not None:
+                    with torch.no_grad():
+                        mask = torch.zeros_like(param.grad)
+                        mask[self.expert_idx] = 1.0
+                        param.grad *= mask
 
-    #     return loss
+        return loss
 
 
 
@@ -595,6 +811,240 @@ def resolve_resume_checkpoint(sft_args, checkpoint_path: pathlib.Path) -> str | 
 
     return None
 
+
+
+def remap_qwen25vl_runtime_key(key: str) -> str:
+    """
+    Remap legacy Qwen2.5-VL checkpoint keys to the names expected by the
+    currently loaded wrapper model.
+
+    This is needed for Trainer resume because resume_from_checkpoint loads the
+    raw checkpoint state dict directly; it does not go through from_pretrained's
+    checkpoint conversion mapping.
+    """
+    # legacy vision tower:
+    # visual.blocks... -> model.visual.blocks...
+    if key.startswith("visual."):
+        return "model.visual." + key[len("visual."):]
+
+    # legacy language model:
+    # model.layers...       -> model.language_model.layers...
+    # model.embed_tokens... -> model.language_model.embed_tokens...
+    # model.norm...         -> model.language_model.norm...
+    if key.startswith("model.") and not (
+        key.startswith("model.visual.")
+        or key.startswith("model.language_model.")
+    ):
+        return "model.language_model." + key[len("model."):]
+
+    # lm_head and already-correct keys stay unchanged.
+    return key
+
+
+def get_runtime_key_checkpoint_path(
+    resume_checkpoint: str | None,
+    suffix: str = "-runtime-key",
+) -> str | None:
+    """
+    Return the checkpoint path that trainer.train should use.
+
+    If the checkpoint is a sharded safetensors model, use a derived directory
+    so the original checkpoint remains untouched. Otherwise return the original
+    path unchanged.
+    """
+    if resume_checkpoint is None:
+        return None
+
+    src_ckpt = pathlib.Path(resume_checkpoint).expanduser()
+    if src_ckpt.name.endswith(suffix):
+        return str(src_ckpt)
+
+    if not (src_ckpt / "model.safetensors.index.json").exists():
+        print(
+            f"[checkpoint-key-fix] {src_ckpt} has no model.safetensors.index.json; "
+            "using it unchanged."
+        )
+        return str(src_ckpt)
+
+    return str(src_ckpt.with_name(src_ckpt.name + suffix))
+
+
+def _rewrite_safetensor_shard_keys_if_needed(shard_path: pathlib.Path):
+    """Rewrite one shard in place if it still contains legacy keys."""
+    sd = load_file(str(shard_path), device="cpu")
+    sd2 = {}
+    changed = False
+
+    for old_key, tensor in sd.items():
+        new_key = remap_qwen25vl_runtime_key(old_key)
+        if new_key != old_key:
+            changed = True
+        if new_key in sd2:
+            raise RuntimeError(
+                f"Key collision inside {shard_path.name}: {old_key} -> {new_key}"
+            )
+        sd2[new_key] = tensor
+
+    if not changed:
+        return False
+
+    backup_path = shard_path.with_name(f"{shard_path.name}.legacy_key_backup")
+    if backup_path.exists():
+        raise FileExistsError(
+            f"{backup_path} already exists, but {shard_path} still appears to need remapping. "
+            "Please inspect the checkpoint; a previous run may have stopped midway."
+        )
+
+    shard_path.rename(backup_path)
+    save_file(sd2, str(shard_path), metadata={"format": "pt"})
+    print(f"[checkpoint-key-fix] Rewrote {shard_path.name}")
+    print(f"[checkpoint-key-fix] Backup:  {backup_path.name}")
+    return True
+
+
+def _remap_checkpoint_index_and_shards(ckpt: pathlib.Path):
+    """Apply Fixing Code 1, but make it safe to call repeatedly."""
+    index_path = ckpt / "model.safetensors.index.json"
+    if not index_path.exists():
+        return
+
+    with open(index_path, "r") as f:
+        index = json.load(f)
+
+    old_weight_map = index["weight_map"]
+    new_weight_map = {}
+
+    for old_key, shard_name in old_weight_map.items():
+        new_key = remap_qwen25vl_runtime_key(old_key)
+        if new_key in new_weight_map and new_weight_map[new_key] != shard_name:
+            raise RuntimeError(f"Key collision after remap: {old_key} -> {new_key}")
+        new_weight_map[new_key] = shard_name
+
+    if new_weight_map != old_weight_map:
+        backup_index_path = ckpt / "model.safetensors.index.json.legacy_key_backup"
+        if not backup_index_path.exists():
+            shutil.copy2(index_path, backup_index_path)
+        index["weight_map"] = new_weight_map
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+        print(f"[checkpoint-key-fix] Updated index key names: {index_path}")
+    else:
+        print("[checkpoint-key-fix] Index already uses runtime key names.")
+
+    # Use all shard names now referenced by the updated index. This also lets us
+    # fix a checkpoint whose index was updated but whose shards were not.
+    shard_names = sorted(set(new_weight_map.values()))
+    for shard_name in shard_names:
+        _rewrite_safetensor_shard_keys_if_needed(ckpt / shard_name)
+
+
+def _ensure_lm_head_weight(ckpt: pathlib.Path):
+    """Apply Fixing Code 2: synthesize lm_head.weight from embed_tokens if needed."""
+    index_path = ckpt / "model.safetensors.index.json"
+    if not index_path.exists():
+        return
+
+    embed_key = "model.language_model.embed_tokens.weight"
+    lm_head_key = "lm_head.weight"
+
+    with open(index_path, "r") as f:
+        index = json.load(f)
+
+    weight_map = index["weight_map"]
+
+    if lm_head_key in weight_map:
+        print(f"[checkpoint-key-fix] {lm_head_key} already exists in index: {weight_map[lm_head_key]}")
+        return
+
+    if embed_key not in weight_map:
+        raise KeyError(f"Cannot synthesize {lm_head_key}; missing {embed_key} in index")
+
+    shard_name = weight_map[embed_key]
+    shard_path = ckpt / shard_name
+    backup_path = ckpt / f"{shard_name}.pre_lm_head_backup"
+
+    sd = load_file(str(shard_path), device="cpu")
+    if embed_key not in sd:
+        raise KeyError(f"{embed_key} not found inside {shard_name}")
+
+    if lm_head_key not in sd:
+        if backup_path.exists():
+            raise FileExistsError(
+                f"{backup_path} already exists, but {lm_head_key} is still missing from {shard_name}. "
+                "Please inspect the checkpoint; a previous run may have stopped midway."
+            )
+        sd[lm_head_key] = sd[embed_key].clone()
+        shard_path.rename(backup_path)
+        save_file(sd, str(shard_path), metadata={"format": "pt"})
+        print(f"[checkpoint-key-fix] Added {lm_head_key} to {shard_name}")
+        print(f"[checkpoint-key-fix] Backup: {backup_path.name}")
+
+        added_bytes = sd[lm_head_key].numel() * sd[lm_head_key].element_size()
+        if isinstance(index.get("metadata", {}).get("total_size"), int):
+            index["metadata"]["total_size"] += added_bytes
+    else:
+        print(f"[checkpoint-key-fix] {lm_head_key} already exists inside {shard_name}; only fixing index.")
+
+    weight_map[lm_head_key] = shard_name
+    index["weight_map"] = weight_map
+    with open(index_path, "w") as f:
+        json.dump(index, f, indent=2)
+    print(f"[checkpoint-key-fix] Updated index: {lm_head_key} -> {shard_name}")
+
+
+def prepare_qwen25vl_runtime_key_checkpoint(
+    resume_checkpoint: str | None,
+    suffix: str = "-runtime-key",
+) -> str | None:
+    """
+    Create/use a resume checkpoint whose tensor keys match the runtime model.
+
+    The returned path should be passed to trainer.train(resume_from_checkpoint=...).
+    The original checkpoint is not modified unless the input path already ends
+    with suffix.
+    """
+    if resume_checkpoint is None:
+        return None
+
+    src_ckpt = pathlib.Path(resume_checkpoint).expanduser()
+    if not src_ckpt.exists():
+        raise FileNotFoundError(f"Resume checkpoint does not exist: {src_ckpt}")
+
+    if not (src_ckpt / "model.safetensors.index.json").exists():
+        print(
+            f"[checkpoint-key-fix] {src_ckpt} has no model.safetensors.index.json; "
+            "skipping key fix."
+        )
+        return str(src_ckpt)
+
+    if src_ckpt.name.endswith(suffix):
+        dst_ckpt = src_ckpt
+    else:
+        dst_ckpt = src_ckpt.with_name(src_ckpt.name + suffix)
+        if not dst_ckpt.exists():
+            print(f"[checkpoint-key-fix] Copying checkpoint for runtime-key resume:")
+            print(f"[checkpoint-key-fix]   src: {src_ckpt}")
+            print(f"[checkpoint-key-fix]   dst: {dst_ckpt}")
+            shutil.copytree(src_ckpt, dst_ckpt)
+        else:
+            print(f"[checkpoint-key-fix] Using existing runtime-key checkpoint: {dst_ckpt}")
+
+    _remap_checkpoint_index_and_shards(dst_ckpt)
+    _ensure_lm_head_weight(dst_ckpt)
+
+    marker_path = dst_ckpt / ".qwen25vl_runtime_key_fix_done"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "source_checkpoint": str(src_ckpt),
+                "runtime_checkpoint": str(dst_ckpt),
+                "fixed_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        )
+    )
+
+    return str(dst_ckpt)
 
 def delete_intermediate_checkpoints(checkpoint_path: pathlib.Path, final_output_dir: str):
     """Delete checkpoint-* directories after training has completed successfully."""
@@ -666,32 +1116,48 @@ def main():
         device_map=None,  # device_map conflicts with DeepSpeed, use auto if single gpu
     )
 
+    print("Loaded model class:", type(model))
+    print("Config class:", type(model.config))
+    print("Model type:", model.config.model_type)
+    print("Conversion mapping:", getattr(model, "_checkpoint_conversion_mapping", None))
+
+    names = [name for name, _ in model.named_parameters()]
+    print("has wrapped language_model:", any(n.startswith("model.language_model.layers.0") for n in names))
+    print("has raw model.layers:", any(n.startswith("model.layers.0") for n in names))
+    print("has wrapped visual:", any(n.startswith("model.visual.blocks.0") for n in names))
+    print("has raw visual:", any(n.startswith("visual.blocks.0") for n in names))
+
     # ------------------------------------------------------------------
     # Expert freezing — must happen before LoRA so that PEFT sees the
     # correct requires_grad state when deciding which modules to wrap.
     # ------------------------------------------------------------------
-    # if sft_args.router_tuning_only:
-    #     print("Freezing all weights except router gate weights.")
-    #     freeze_all_except_router(model)
-    #     model.enable_input_require_grads() # Need this to still build computational graph?
-    #     print_trainable_parameters(model)
-    # elif sft_args.train_expert_idx is not None:
-    #     print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
-    #           f"({'LoRA adapters' if sft_args.use_lora else 'full fine-tune'}).")
-    #     freeze_all_except_expert(
-    #         model,
-    #         expert_idx=sft_args.train_expert_idx,
-    #         use_lora=sft_args.use_lora,
-    #     )
-    #     model.enable_input_require_grads() # Need this to still build computational graph?
+    if sft_args.router_tuning_only:
+        print("Freezing all weights except router gate weights.")
+        freeze_all_except_router(model)
+        model.enable_input_require_grads() # Need this to still build computational graph?
+        print_trainable_parameters(model)
+    elif sft_args.train_expert_idx is not None:
+        print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
+              f"({'LoRA adapters' if sft_args.use_lora else 'full fine-tune'}).")
+        print_trainable_parameters(model)
+        freeze_all_except_expert(
+            model,
+            expert_idx=sft_args.train_expert_idx,
+            use_lora=sft_args.use_lora,
+        )
+        print("After freezing expert:")
+        print_trainable_parameters(model)
+        model.enable_input_require_grads() # Need this to still build computational graph?
 
-    # if sft_args.unfreeze_attn:
-    #     print("unfreeze_attn=True: unfreezing attention layers.")
-    #     unfreeze_attention_layers(model)
+    if sft_args.unfreeze_attn:
+        raise NotImplementedError("unfreeze_attn is not implemented for mm_tune.py")
+        print("unfreeze_attn=True: unfreezing attention layers.")
+        unfreeze_attention_layers(model)
 
-    # if sft_args.unfreeze_embed:
-    #     print("unfreeze_embed=True: unfreezing embedding layers.")
-    #     unfreeze_embedding_layers(model)
+    if sft_args.unfreeze_embed:
+        raise NotImplementedError("unfreeze_embed is not implemented for mm_tune.py")
+        print("unfreeze_embed=True: unfreezing embedding layers.")
+        unfreeze_embedding_layers(model)
 
     # ------------------------------------------------------------------
     # LoRA setup
@@ -773,7 +1239,14 @@ def main():
 
     checkpoint_path = paths["checkpoints"]
     checkpoint_path.mkdir(parents=True, exist_ok=True)
-    resume_checkpoint = resolve_resume_checkpoint(sft_args, checkpoint_path)
+    raw_resume_checkpoint = resolve_resume_checkpoint(sft_args, checkpoint_path)
+    if sft_args.fix_resume_checkpoint_keys:
+        resume_checkpoint = get_runtime_key_checkpoint_path(
+            raw_resume_checkpoint,
+            suffix=sft_args.runtime_key_checkpoint_suffix,
+        )
+    else:
+        resume_checkpoint = raw_resume_checkpoint
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
@@ -798,6 +1271,8 @@ def main():
     # VLM-specific safety
     sft_config.remove_unused_columns = False
     sft_config.max_length = None
+    if sft_args.train_expert_idx is not None:
+        sft_config.gradient_checkpointing_kwargs = {"use_reentrant": False}
 
     if sft_args.skip_eval:
         sft_config.eval_strategy = "no"
@@ -831,14 +1306,40 @@ def main():
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
-    trainer = SFTTrainer(
+    optimizer = build_vlm_optimizer(
+        model,
+        sft_config,
+        lr_vision=sft_args.lr_vision,
+        lr_llm=sft_args.lr_llm,
+        lr_connector=sft_args.lr_connector
+    )
+
+    trainer = ExpertSFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         processing_class=processor,
+        optimizers=(optimizer, None),  # let Trainer create scheduler only if you handle it separately
         callbacks=[WandbLoggingCallback(wandb_stats)],
+        expert_idx=sft_args.train_expert_idx,
     )
+
+    # Materialize the fixed resume checkpoint after Trainer/Accelerate exists, so
+    # only rank 0 rewrites files and all other ranks wait before loading them.
+    if raw_resume_checkpoint is not None and sft_args.fix_resume_checkpoint_keys:
+        if trainer.is_world_process_zero():
+            fixed_checkpoint = prepare_qwen25vl_runtime_key_checkpoint(
+                raw_resume_checkpoint,
+                suffix=sft_args.runtime_key_checkpoint_suffix,
+            )
+            if fixed_checkpoint != resume_checkpoint:
+                raise RuntimeError(
+                    f"Internal checkpoint path mismatch: expected {resume_checkpoint}, got {fixed_checkpoint}"
+                )
+        trainer.accelerator.wait_for_everyone()
+        if not pathlib.Path(resume_checkpoint).exists():
+            raise FileNotFoundError(f"Fixed resume checkpoint was not created: {resume_checkpoint}")
 
     batch = next(iter(trainer.get_train_dataloader()))
 
@@ -863,26 +1364,36 @@ def main():
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     final_output_dir = os.path.join(str(checkpoint_path), "final")
 
-    if sft_args.use_lora and sft_args.merge_and_save:
-        print("Merging LoRA weights into base model...")
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(final_output_dir)
-        tokenizer.save_pretrained(final_output_dir)
-        processor.save_pretrained(final_output_dir)
-        print(f"Merged model saved to {final_output_dir}")
-    else:
-        trainer.save_model(output_dir=final_output_dir)
-        tokenizer.save_pretrained(final_output_dir)
-        processor.save_pretrained(final_output_dir)
-        if sft_args.use_lora:
-            print(f"LoRA adapter saved to {final_output_dir}")
 
-    if not sft_args.skip_eval:
+    # Wait for all ranks to finish training
+    trainer.accelerator.wait_for_everyone()
+
+    # Save only from rank 0 / main process
+    if trainer.is_world_process_zero():
+        if sft_args.use_lora and sft_args.merge_and_save:
+            print("Merging LoRA weights into base model...")
+            merged_model = model.merge_and_unload()
+            merged_model.save_pretrained(final_output_dir)
+            tokenizer.save_pretrained(final_output_dir)
+            processor.save_pretrained(final_output_dir)
+            print(f"Merged model saved to {final_output_dir}")
+        else:
+            trainer.save_model(output_dir=final_output_dir)
+            tokenizer.save_pretrained(final_output_dir)
+            processor.save_pretrained(final_output_dir)
+            if sft_args.use_lora:
+                print(f"LoRA adapter saved to {final_output_dir}")
+
+    trainer.accelerator.wait_for_everyone()
+
+    if not sft_args.skip_eval and trainer.is_world_process_zero():
         trainer.evaluate()  # Final evaluation after training
 
-    if sft_args.delete_intermediate_checkpoints:
+    if sft_args.delete_intermediate_checkpoints and trainer.is_world_process_zero():
+        print("Training completed successfully. Deleting intermediate checkpoints...")
         delete_intermediate_checkpoints(checkpoint_path, final_output_dir)
 
+    trainer.accelerator.wait_for_everyone()
     wandb.finish()
     
 if __name__ == "__main__":
