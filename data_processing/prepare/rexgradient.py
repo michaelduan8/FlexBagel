@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset",
-        required=True,
+        default="rajpurkarlab/ReXGradient-160K",
         help="Hugging Face dataset path, e.g. org/dataset_name.",
     )
     parser.add_argument(

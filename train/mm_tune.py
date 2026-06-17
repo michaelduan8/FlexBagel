@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datasets import load_dataset, Dataset, concatenate_datasets, Image, Sequence
 from datetime import datetime
 from dotenv import load_dotenv
-from peft import LoraConfig, TaskType, get_peft_model
+# from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image as PILImage
 from PIL import ImageFile
 import struct
@@ -307,10 +307,9 @@ def preprocess_dataset(dataset):
         item["image_sizes"] = sizes
         return item
 
-    def convert_row(item):
+    def convert_row(item, idx):
         image_key = "images"
-        assert image_key in item and "conversation" in item and "id" in item
-
+        assert image_key in item and "conversation" in item
         # Convert bytes → PIL here, no multiprocessing so no pickling issues
         # images = []
         # for img_bytes in item["image_bytes"]:
@@ -341,7 +340,7 @@ def preprocess_dataset(dataset):
         # except Exception as e:
         #     print(f"Error processing image bytes for item {item['id']}: {e}")
 
-        id = item["id"]
+        id = item["id"] if "id" in item else idx
         conversation = item["conversation"]
         assert conversation[-1]["role"] == "assistant"
         # assert len(conversation) <= 3
@@ -382,7 +381,7 @@ def preprocess_dataset(dataset):
         }
 
     #dataset = dataset.map(load_bytes, num_proc=24)
-    dataset = dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=12).filter(lambda x: x["images"] is not None)
+    dataset = dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=12, with_indices=True).filter(lambda x: x["images"] is not None)
     dataset = dataset.cast_column("images", Sequence(Image()))
 
     # widths_kept = [w for row in dataset["image_widths"] for w in row]
@@ -1112,7 +1111,8 @@ def main():
     model = AutoModelForImageTextToText.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
+        attn_implementation={"": "sdpa"},
         device_map=None,  # device_map conflicts with DeepSpeed, use auto if single gpu
     )
 
