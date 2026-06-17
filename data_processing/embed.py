@@ -808,7 +808,14 @@ def main() -> None:
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive")
 
-    emb_path = args.output_dir / f"embeddings_{args.embed_mode}.npy"
+    output_dir = Path(args.output_dir)
+    modes = ["prompt", "image_only"] if args.embed_mode == "both" else [args.embed_mode]
+
+    missing = [
+        mode for mode in modes
+        if not (out_dir / f"embeddings_{mode}.npy").exists()
+    ]
+    emb_path = output_dir / f"embeddings_{args.embed_mode}.npy"
     if not emb_path.exists():
         torch.set_grad_enabled(False)
 
@@ -847,11 +854,10 @@ def main() -> None:
 
         print(f"Total skipped bad-image rows across requested mode(s): {total_skipped_bad_images}")
     
-    else:
-        embeddings = np.load(emb_path)
-        row_average = np.mean(embeddings, axis=0)
-        print("Final embeddings shape:", row_average.shape)
-        np.save(f"{args.output_dir}/average_embeddings_{args.embed_mode}.npy", row_average)
+    embeddings = np.load(emb_path)
+    row_average = np.mean(embeddings, axis=0)
+    print("Final embeddings shape:", row_average.shape)
+    np.save(output_dir / f"average_embeddings_{args.embed_mode}.npy", row_average)
 
 
 if __name__ == "__main__":
