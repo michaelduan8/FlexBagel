@@ -29,6 +29,92 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 _ORIG_GETEXIF = PILImage.Image.getexif
 
+def has_xpu():
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def setup_aurora_distributed_env():
+    """
+    Minimal Aurora/PALS -> PyTorch distributed env bridge.
+
+    Use this with:
+      mpiexec --pmi=pmix --envall -n <total_ranks> --ppn 12 python mm_tune.py ...
+    """
+
+    # oneCCL/Aurora defaults. These must be set before torch distributed init.
+    os.environ.setdefault("CCL_PROCESS_LAUNCHER", "pmix")
+    os.environ.setdefault("CCL_ATL_TRANSPORT", "mpi")
+    os.environ.setdefault("CCL_KVS_MODE", "mpi")
+    os.environ.setdefault("FI_MR_CACHE_MONITOR", "userfaultfd")
+
+    # If not launched by Aurora/PALS, keep normal single-process / torchrun behavior.
+    if "PALS_LOCAL_RANKID" not in os.environ:
+        if "LOCAL_RANK" in os.environ:
+            os.environ.setdefault("CCL_PROCESS_LAUNCHER", "torchrun")
+            os.environ.setdefault("CCL_LOCAL_RANK", os.environ["LOCAL_RANK"])
+            os.environ.setdefault("CCL_LOCAL_SIZE", os.environ.get("LOCAL_WORLD_SIZE", "1"))
+            if has_xpu():
+                torch.xpu.set_device(int(os.environ["LOCAL_RANK"]))
+        return
+
+    from mpi4py import MPI
+    import socket
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+
+    local_rank = int(os.environ["PALS_LOCAL_RANKID"])
+    local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    local_world_size = local_comm.Get_size()
+
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+
+    # oneCCL also likes these explicitly available.
+    os.environ["CCL_LOCAL_RANK"] = str(local_rank)
+    os.environ["CCL_LOCAL_SIZE"] = str(local_world_size)
+
+    if "MASTER_ADDR" not in os.environ:
+        master_addr = socket.gethostname() if rank == 0 else None
+        master_addr = comm.bcast(master_addr, root=0)
+        os.environ["MASTER_ADDR"] = f"{master_addr}.hsn.cm.aurora.alcf.anl.gov"
+
+    os.environ.setdefault("MASTER_PORT", "2345")
+
+    if has_xpu():
+        torch.xpu.set_device(local_rank)
+
+    print(
+        f"[aurora-ddp] rank={rank}/{world_size} "
+        f"local_rank={local_rank}/{local_world_size} "
+        f"master={os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        flush=True,
+    )
+
+
+def get_accelerator_world_size():
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def get_device_name_for_logging():
+    if has_xpu():
+        props = torch.xpu.get_device_properties(torch.xpu.current_device())
+        return getattr(props, "name", "xpu")
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name()
+    return "cpu"
+
+
+def get_memory_allocated_gb_for_logging():
+    if has_xpu() and hasattr(torch.xpu, "memory_allocated"):
+        return torch.xpu.memory_allocated() / 1024 ** 3
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024 ** 3
+    return 0
+
 def safe_getexif(self):
     try:
         return _ORIG_GETEXIF(self)
@@ -101,6 +187,18 @@ class SFTArgs:
         default=False,
         metadata={"help": "If set, unfreeze embedding layer parameters after expert/router freezing and before LoRA setup."}
     )
+    norm_topk_prob: bool = field(
+        default=False,
+        metadata={"help": "If set, normalize the topk probability of the router gate."}
+    )
+    output_router_logits: bool = field(
+        default=False,
+        metadata={"help": "If set, output the router logits."}
+    )
+    num_experts_per_tok: int = field(
+        default=1,
+        metadata={"help": "Number of experts per token."}
+    )
 
     # LoRA parameters
     use_lora: bool = field(default=False, metadata={"help": "Enable LoRA training"})
@@ -157,26 +255,31 @@ def build_vlm_optimizer(
         else:
             other_params.append(param)
 
-    optimizer_grouped_parameters = [
-        {
+    optimizer_grouped_parameters = []
+
+    if vision_params:
+        optimizer_grouped_parameters.append({
             "params": vision_params,
             "lr": lr_vision,
             "weight_decay": sft_config.weight_decay,
             "name": "vision_tower",
-        },
-        {
+        })
+
+    if llm_params:
+        optimizer_grouped_parameters.append({
             "params": llm_params,
             "lr": lr_llm,
             "weight_decay": sft_config.weight_decay,
             "name": "llm_decoder",
-        },
-        {
+        })
+
+    if connector_params:
+        optimizer_grouped_parameters.append({
             "params": connector_params,
             "lr": lr_connector,
             "weight_decay": sft_config.weight_decay,
             "name": "vl_connector_mlp",
-        },
-    ]
+        })
 
     if len(other_params) > 0:
         optimizer_grouped_parameters.append(
@@ -727,16 +830,60 @@ def freeze_all_except_router(model):
 
 class ExpertSFTTrainer(SFTTrainer):
     """
-    SFTTrainer subclass that zeroes out router gate gradients for all experts
-    except the target one, after backward but before the optimizer step.
-
-    This is preferable to a backward hook because the gradient zeroing happens
-    at a well-defined point in the training loop, and Adam's momentum/variance
-    buffers for the frozen rows are never updated with non-zero values.
+    SFTTrainer subclass that:
+      1. builds your custom VLM optimizer with separate LR groups
+      2. masks router gradients for all experts except expert_idx
     """
-    def __init__(self, *args, expert_idx: int = None, **kwargs):
-        super().__init__(*args, **kwargs)
+
+    def __init__(
+        self,
+        *args,
+        expert_idx: int = None,
+        lr_vision: float = None,
+        lr_llm: float = None,
+        lr_connector: float = None,
+        **kwargs,
+    ):
         self.expert_idx = expert_idx
+        self.lr_vision = lr_vision
+        self.lr_llm = lr_llm
+        self.lr_connector = lr_connector
+        super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        """
+        Let Trainer/Accelerate own optimizer creation timing.
+        This is safer with FSDP than constructing AdamW before Trainer setup.
+        """
+        if self.optimizer is None:
+            self.optimizer = build_vlm_optimizer(
+                self.model,
+                self.args,
+                lr_vision=self.lr_vision,
+                lr_llm=self.lr_llm,
+                lr_connector=self.lr_connector,
+            )
+
+        return self.optimizer
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
+        # Do NOT call TRL SFTTrainer.compute_loss, because it expects outputs.logits.
+        outputs = model(**inputs)
+
+        loss = outputs.loss
+        if loss is None:
+            raise RuntimeError(
+                "Model returned loss=None. Patch-4 requires the model forward "
+                "to compute and return outputs.loss when labels are provided."
+            )
+
+        return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         loss = super().training_step(model, inputs, num_items_in_batch)
@@ -744,10 +891,24 @@ class ExpertSFTTrainer(SFTTrainer):
         if self.expert_idx is not None:
             for name, param in model.named_parameters():
                 if ".mlp.gate.weight" in name and param.grad is not None:
+                    grad = param.grad
+
+                    if grad.ndim != 2:
+                        print(
+                            f"[WARN] skip router grad mask for {name}, grad shape={tuple(grad.shape)}",
+                            flush=True,
+                        )
+                        continue
+
                     with torch.no_grad():
-                        mask = torch.zeros_like(param.grad)
-                        mask[self.expert_idx] = 1.0
-                        param.grad *= mask
+                        mask = torch.zeros(
+                            grad.shape[0],
+                            1,
+                            device=grad.device,
+                            dtype=grad.dtype,
+                        )
+                        mask[self.expert_idx, 0] = 1
+                        grad.mul_(mask)
 
         return loss
 
@@ -1063,6 +1224,7 @@ def delete_intermediate_checkpoints(checkpoint_path: pathlib.Path, final_output_
 
 
 def main():
+    setup_aurora_distributed_env()
     parser = HfArgumentParser([SFTConfig, SFTArgs])
     sft_config, sft_args = parser.parse_args_into_dataclasses()
 
@@ -1106,10 +1268,21 @@ def main():
     # measure_vlm_lengths(train_dataset, processor, n=500)
     # assert False
 
-    use_bf16 = torch.cuda.is_bf16_supported()
+    use_bf16 = True if has_xpu() else torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
+    config = AutoConfig.from_pretrained(model_name)
+
+    config.text_config.num_experts_per_tok = sft_args.num_experts_per_tok
+    config.text_config.norm_topk_prob = sft_args.norm_topk_prob
+    config.text_config.output_router_logits = sft_args.output_router_logits
+
+    config.vision_config.num_experts_per_tok = sft_args.num_experts_per_tok
+    config.vision_config.norm_topk_prob = sft_args.norm_topk_prob
+    config.vision_config.output_router_logits = sft_args.output_router_logits
+
     model = AutoModelForImageTextToText.from_pretrained(
         model_name,
+        config=config,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
         # attn_implementation="flash_attention_2",
         attn_implementation={"": "sdpa"},
@@ -1248,7 +1421,7 @@ def main():
     else:
         resume_checkpoint = raw_resume_checkpoint
 
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    num_gpus = get_accelerator_world_size()
 
     per_device_train_batch_size = sft_config.per_device_train_batch_size
     gradient_accumulation_steps = sft_config.gradient_accumulation_steps
@@ -1267,6 +1440,9 @@ def main():
     sft_config.completion_only_loss = True
     sft_config.seed = run_seed
     sft_config.data_seed = run_seed
+
+    if has_xpu() and get_accelerator_world_size() > 1:
+        sft_config.ddp_backend = "xccl"
 
     # VLM-specific safety
     sft_config.remove_unused_columns = False
@@ -1294,8 +1470,8 @@ def main():
         "test_dataset_size": len(test_dataset) if test_dataset is not None else 0,
         # **train_stats,
         # **test_stats,
-        "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-        "initial_gpu_memory_gb": torch.cuda.memory_allocated() / 1024 ** 3 if torch.cuda.is_available() else 0,
+        "gpu_name": get_device_name_for_logging(),
+        "initial_gpu_memory_gb": get_memory_allocated_gb_for_logging(),
         "use_lora": sft_args.use_lora,
         # "router_tuning_only": sft_args.router_tuning_only,
         # "unfreeze_attn": sft_args.unfreeze_attn,
@@ -1306,23 +1482,17 @@ def main():
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
-    optimizer = build_vlm_optimizer(
-        model,
-        sft_config,
-        lr_vision=sft_args.lr_vision,
-        lr_llm=sft_args.lr_llm,
-        lr_connector=sft_args.lr_connector
-    )
-
     trainer = ExpertSFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         processing_class=processor,
-        optimizers=(optimizer, None),  # let Trainer create scheduler only if you handle it separately
         callbacks=[WandbLoggingCallback(wandb_stats)],
         expert_idx=sft_args.train_expert_idx,
+        lr_vision=sft_args.lr_vision,
+        lr_llm=sft_args.lr_llm,
+        lr_connector=sft_args.lr_connector,
     )
 
     # Materialize the fixed resume checkpoint after Trainer/Accelerate exists, so
