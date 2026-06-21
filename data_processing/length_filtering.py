@@ -10,6 +10,7 @@ Supports Qwen2 / Qwen2.5-VL processors.
 import argparse
 import math
 import os
+import struct
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,8 +163,7 @@ def get_image_info(
     """
     img_path = resolve_image_path(img_item, image_root=image_root, input_parent=input_parent)
 
-    with Image.open(img_path) as img:
-        width, height = img.size
+    width, height = read_image_size_fast(img_path)
 
     ip = processor.image_processor
     patch_size = getattr(ip, "patch_size", 14)
@@ -238,6 +238,27 @@ def count_image_placeholders(messages: list[dict]) -> int:
         for part in msg["content"]
         if part["type"] == "image"
     )
+
+def read_image_size_fast(img_path: Path) -> tuple[int, int]:
+    """
+    Return (width, height) without decoding image pixels.
+    For PNG, read IHDR directly so Pillow does not parse huge text metadata.
+    Falls back to Pillow for non-PNG files.
+    """
+    with img_path.open("rb") as f:
+        header = f.read(24)
+
+    # PNG signature + IHDR chunk
+    if (
+        len(header) >= 24
+        and header[:8] == b"\x89PNG\r\n\x1a\n"
+        and header[12:16] == b"IHDR"
+    ):
+        width, height = struct.unpack(">II", header[16:24])
+        return int(width), int(height)
+
+    with Image.open(img_path) as img:
+        return img.size
 
 
 # ---------------------------------------------------------------------------
@@ -556,19 +577,19 @@ def main(cfg: Config) -> None:
     print("Building image token cache...")
     image_token_cache, undersized_paths = build_image_token_cache(dataset, processor, cfg, input_parent)
 
-    # --- Size filter (before length measurement to avoid wasted work) ---
-    if undersized_paths:
-        print(f"\nFiltering examples with images smaller than {cfg.min_image_width}x{cfg.min_image_height}...")
-        dataset, removed_small = split_by_image_size(dataset, undersized_paths, cfg.image_root, input_parent)
-        print(
-            f"Size filter: {len(dataset) + len(removed_small)} → {len(dataset)} "
-            f"(removed {len(removed_small)}, "
-            f"{len(removed_small) / max(len(dataset) + len(removed_small), 1) * 100:.2f}%)"
-        )
-        print(f"Saving size-filtered examples → {cfg.small_image_dataset}")
-        save_dataset(removed_small, cfg.small_image_dataset)
-    else:
-        print("No undersized images found — skipping size filter.")
+    # # --- Size filter (before length measurement to avoid wasted work) ---
+    # if undersized_paths:
+    #     print(f"\nFiltering examples with images smaller than {cfg.min_image_width}x{cfg.min_image_height}...")
+    #     dataset, removed_small = split_by_image_size(dataset, undersized_paths, cfg.image_root, input_parent)
+    #     print(
+    #         f"Size filter: {len(dataset) + len(removed_small)} → {len(dataset)} "
+    #         f"(removed {len(removed_small)}, "
+    #         f"{len(removed_small) / max(len(dataset) + len(removed_small), 1) * 100:.2f}%)"
+    #     )
+    #     print(f"Saving size-filtered examples → {cfg.small_image_dataset}")
+    #     save_dataset(removed_small, cfg.small_image_dataset)
+    # else:
+    #     print("No undersized images found — skipping size filter.")
 
     # --- Length measurement ---
     print("\nMeasuring VLM sequence lengths...")
@@ -607,22 +628,22 @@ def main(cfg: Config) -> None:
     print_length_stats(kept["vlm_length"], "Kept", cfg.bad_length)
     print_length_stats(removed_long["vlm_length"], "Removed (too long)", cfg.bad_length)
 
-    if not cfg.keep_length_columns:
-        kept = drop_length_columns(kept, LENGTH_COLUMNS)
-        removed_long = drop_length_columns(removed_long, LENGTH_COLUMNS)
+    # if not cfg.keep_length_columns:
+    #     kept = drop_length_columns(kept, LENGTH_COLUMNS)
+    #     removed_long = drop_length_columns(removed_long, LENGTH_COLUMNS)
 
-    print(f"Saving kept examples → {cfg.output_dataset}")
-    save_dataset(kept, cfg.output_dataset)
+    # print(f"Saving kept examples → {cfg.output_dataset}")
+    # save_dataset(kept, cfg.output_dataset)
 
-    print(f"Saving length-filtered examples → {cfg.removed_dataset}")
-    save_dataset(removed_long, cfg.removed_dataset)
+    # print(f"Saving length-filtered examples → {cfg.removed_dataset}")
+    # save_dataset(removed_long, cfg.removed_dataset)
 
     print("Done.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Filter a multimodal dataset by VLM token length.")
-    parser.add_argument("dataset_name", help="Dataset name or path prefix (without .jsonl extension)")
+    parser.add_argument("--dataset_name", help="Dataset name or path prefix (without .jsonl extension)")
     args = parser.parse_args()
 
     main(Config(dataset_name=args.dataset_name))
