@@ -38,6 +38,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
 from .configuration_flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeTextConfig, Flex_Qwen2_5_VLMoeVisionConfig
 
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.profiler import profile, ProfilerActivity
+
 logger = logging.get_logger(__name__)
 
 
@@ -328,6 +331,38 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def repeat_kv_bshd(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Repeat K/V heads while preserving BSHD physical layout for XPU FlashAttention.
+
+    Input logical shape:  [B, KVH, S, D]
+    Output logical shape: [B, KVH * n_rep, S, D]
+
+    Important: output should be logical BHSD but physically BSHD-backed.
+    """
+    if n_rep == 1:
+        return hidden_states
+
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+
+    # Convert logical [B, KVH, S, D] to [B, S, KVH, D].
+    # Make it contiguous in BSHD layout before expanding.
+    hidden_states = hidden_states.transpose(1, 2).contiguous()
+
+    # [B, S, KVH, 1, D] -> [B, S, KVH, n_rep, D]
+    hidden_states = hidden_states[:, :, :, None, :].expand(
+        batch, slen, num_key_value_heads, n_rep, head_dim
+    )
+
+    # [B, S, KVH * n_rep, D]
+    hidden_states = hidden_states.reshape(
+        batch, slen, num_key_value_heads * n_rep, head_dim
+    )
+
+    # Back to logical [B, H, S, D], but physically BSHD-backed.
+    return hidden_states.transpose(1, 2)
+
+
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -352,6 +387,46 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
+
+def run_sdpa(q, k, v, causal_mask, is_causal, scaling, force_flash=False):
+    if force_flash:
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=causal_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+                scale=scaling,
+            )
+    else:
+        return F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=causal_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scaling,
+        )
+
+def profile_one(name, q, k, v, causal_mask, is_causal, scaling, force_flash=False):
+    torch.xpu.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
+        record_shapes=True,
+        with_stack=False,
+    ) as prof:
+        y = run_sdpa(q, k, v, causal_mask, is_causal, scaling, force_flash=force_flash)
+        torch.xpu.synchronize()
+
+    print(f"\n===== {name} =====")
+    print(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=80))
+
+    print("\n[attention-related ops]")
+    for evt in prof.key_averages():
+        key = evt.key.lower()
+        if any(s in key for s in ["scaled", "sdpa", "flash", "attention", "xpu", "onednn", "mkldnn"]):
+            print(evt.key)
+
 
 def sdpa_attention_forward_force_kv_expand(
     module: nn.Module,
@@ -382,8 +457,10 @@ def sdpa_attention_forward_force_kv_expand(
             )
 
         n_rep = query.shape[1] // key.shape[1]
-        key = repeat_kv(key, n_rep)
-        value = repeat_kv(value, n_rep)
+        # key = repeat_kv(key, n_rep)
+        # value = repeat_kv(value, n_rep)
+        key = repeat_kv_bshd(key, n_rep)
+        value = repeat_kv_bshd(value, n_rep)
 
     causal_mask = attention_mask
     if causal_mask is not None:
@@ -392,6 +469,29 @@ def sdpa_attention_forward_force_kv_expand(
     # If a mask is supplied, do not also set is_causal=True.
     is_causal = causal_mask is None and getattr(module, "is_causal", False) and query.shape[-2] > 1
 
+    # if causal_mask is not None:
+    #     print("[SDPA DEBUG]")
+    #     print("is_causal:", is_causal, "mask:", causal_mask is not None, "dropout:", dropout)
+    #     print("query", query.shape, query.stride(), query.is_contiguous())
+    #     print("key", key.shape, key.stride(), key.is_contiguous())
+    #     print("value", value.shape, value.stride(), value.is_contiguous())
+    #     print("q", tuple(query.shape), query.stride(), query.dtype, query.device)
+    #     print("k", tuple(key.shape), key.stride(), key.dtype, key.device)
+    #     print("v", tuple(value.shape), value.stride(), value.dtype, value.device)
+    #     profile_one(
+    #         "default_sdpa",
+    #         query, key, value,
+    #         causal_mask, is_causal, scaling,
+    #         force_flash=False,
+    #     )
+
+    #     profile_one(
+    #         "forced_flash",
+    #         query, key, value,
+    #         causal_mask, is_causal, scaling,
+    #         force_flash=True,
+    #     )
+    #     assert False      
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query,
         key,
@@ -449,9 +549,9 @@ class Flex_Qwen2_5_VLMoeVisionAttention(nn.Module):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
+        query_states = query_states.contiguous().transpose(0, 1).unsqueeze(0)
+        key_states = key_states.contiguous().transpose(0, 1).unsqueeze(0)
+        value_states = value_states.contiguous().transpose(0, 1).unsqueeze(0)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation == "sdpa":
