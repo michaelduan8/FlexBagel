@@ -45,7 +45,7 @@ class Config:
     seed: int = 2026
 
     # Filtering: at least one must be set; if both are set, the stricter wins
-    max_vlm_length: Optional[int] = 2048
+    max_vlm_length: Optional[int] = 4096
     max_vlm_length_percentile: Optional[float] = None
 
     # Minimum image dimensions — examples with any image smaller than this are
@@ -577,19 +577,19 @@ def main(cfg: Config) -> None:
     print("Building image token cache...")
     image_token_cache, undersized_paths = build_image_token_cache(dataset, processor, cfg, input_parent)
 
-    # # --- Size filter (before length measurement to avoid wasted work) ---
-    # if undersized_paths:
-    #     print(f"\nFiltering examples with images smaller than {cfg.min_image_width}x{cfg.min_image_height}...")
-    #     dataset, removed_small = split_by_image_size(dataset, undersized_paths, cfg.image_root, input_parent)
-    #     print(
-    #         f"Size filter: {len(dataset) + len(removed_small)} → {len(dataset)} "
-    #         f"(removed {len(removed_small)}, "
-    #         f"{len(removed_small) / max(len(dataset) + len(removed_small), 1) * 100:.2f}%)"
-    #     )
-    #     print(f"Saving size-filtered examples → {cfg.small_image_dataset}")
-    #     save_dataset(removed_small, cfg.small_image_dataset)
-    # else:
-    #     print("No undersized images found — skipping size filter.")
+    # --- Size filter (before length measurement to avoid wasted work) ---
+    if undersized_paths:
+        print(f"\nFiltering examples with images smaller than {cfg.min_image_width}x{cfg.min_image_height}...")
+        dataset, removed_small = split_by_image_size(dataset, undersized_paths, cfg.image_root, input_parent)
+        print(
+            f"Size filter: {len(dataset) + len(removed_small)} → {len(dataset)} "
+            f"(removed {len(removed_small)}, "
+            f"{len(removed_small) / max(len(dataset) + len(removed_small), 1) * 100:.2f}%)"
+        )
+        print(f"Saving size-filtered examples → {cfg.small_image_dataset}")
+        save_dataset(removed_small, cfg.small_image_dataset)
+    else:
+        print("No undersized images found — skipping size filter.")
 
     # --- Length measurement ---
     print("\nMeasuring VLM sequence lengths...")
@@ -628,15 +628,15 @@ def main(cfg: Config) -> None:
     print_length_stats(kept["vlm_length"], "Kept", cfg.bad_length)
     print_length_stats(removed_long["vlm_length"], "Removed (too long)", cfg.bad_length)
 
-    # if not cfg.keep_length_columns:
-    #     kept = drop_length_columns(kept, LENGTH_COLUMNS)
-    #     removed_long = drop_length_columns(removed_long, LENGTH_COLUMNS)
+    if not cfg.keep_length_columns:
+        kept = drop_length_columns(kept, LENGTH_COLUMNS)
+        removed_long = drop_length_columns(removed_long, LENGTH_COLUMNS)
 
-    # print(f"Saving kept examples → {cfg.output_dataset}")
-    # save_dataset(kept, cfg.output_dataset)
+    print(f"Saving kept examples → {cfg.output_dataset}")
+    save_dataset(kept, cfg.output_dataset)
 
-    # print(f"Saving length-filtered examples → {cfg.removed_dataset}")
-    # save_dataset(removed_long, cfg.removed_dataset)
+    print(f"Saving length-filtered examples → {cfg.removed_dataset}")
+    save_dataset(removed_long, cfg.removed_dataset)
 
     print("Done.")
 

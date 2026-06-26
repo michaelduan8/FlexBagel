@@ -97,6 +97,25 @@ def parse_args():
         help="Loading/saving dtype for checkpoints.",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default="xpu",
+        help=(
+            "Device used for model loading and merging. Default: xpu. "
+            "Use 'auto' to prefer XPU and fall back to CPU, or 'cpu' to force CPU."
+        ),
+    )
+    parser.add_argument(
+        "--save-on-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Move tensors to CPU only for save_pretrained serialization. "
+            "This is safer for safetensors/checkpoint writing. The merge itself still runs on --device. "
+            "Default: true."
+        ),
+    )
+    parser.add_argument(
         "--strict-shared-check",
         action="store_true",
         help="Fail if shared/non-expert tensors differ across models. Default is warn-only.",
@@ -127,6 +146,35 @@ def parse_dtype(name: str) -> torch.dtype:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[name]
+
+
+def xpu_is_available() -> bool:
+    return bool(hasattr(torch, "xpu") and torch.xpu.is_available())
+
+
+def resolve_device(device_name: str) -> torch.device:
+    requested = device_name.lower().strip()
+    if requested == "auto":
+        requested = "xpu" if xpu_is_available() else "cpu"
+
+    device = torch.device(requested)
+    if device.type == "xpu" and not xpu_is_available():
+        raise RuntimeError(
+            "--device xpu was requested, but torch.xpu is not available. "
+            "Install an XPU-enabled PyTorch build/Intel extension stack, or run with --device auto/--device cpu."
+        )
+    return device
+
+
+def empty_device_cache(device: torch.device):
+    if device.type == "xpu" and hasattr(torch.xpu, "empty_cache"):
+        torch.xpu.empty_cache()
+
+
+def tensor_to_device_dtype(tensor: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.is_floating_point() or tensor.is_complex():
+        return tensor.to(device=device, dtype=dtype)
+    return tensor.to(device=device)
 
 
 def cfg_value(cfg: Any, field: str) -> Any:
@@ -255,16 +303,28 @@ def _assert_or_warn_equal(
             log.warning(msg)
 
 
-def load_vlmoe(path: str, dtype: torch.dtype, trust_remote_code: bool):
-    log.info(f"Loading VLMoE model: {path}")
+def load_vlmoe(
+    path: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    trust_remote_code: bool,
+):
+    log.info(f"Loading VLMoE model on {device}: {path}")
     model = Flex_Qwen2_5_VLMoeForConditionalGeneration.from_pretrained(
         path,
         torch_dtype=dtype,
         trust_remote_code=trust_remote_code,
     )
-    sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model = model.to(device=device, dtype=dtype)
+
+    # Keep source tensors on XPU instead of forcing them back to CPU.
+    sd = {
+        k: tensor_to_device_dtype(v.detach().clone(), device=device, dtype=dtype)
+        for k, v in model.state_dict().items()
+    }
     cfg = copy.deepcopy(model.config)
     del model
+    empty_device_cache(device)
     return sd, cfg
 
 
@@ -449,12 +509,14 @@ def main():
         raise ValueError("--shared-from-model out of range.")
 
     dtype = parse_dtype(args.dtype)
+    device = resolve_device(args.device)
+    log.info("Using device=%s, dtype=%s", device, dtype)
 
     # 1) Load all source VLMoE checkpoints.
     source_sds: list[dict[str, torch.Tensor]] = []
     source_cfgs: list[Flex_Qwen2_5_VLMoeConfig] = []
     for p in args.models:
-        sd, cfg = load_vlmoe(p, dtype=dtype, trust_remote_code=args.trust_remote_code)
+        sd, cfg = load_vlmoe(p, dtype=dtype, device=device, trust_remote_code=args.trust_remote_code)
         source_sds.append(sd)
         source_cfgs.append(cfg)
 
@@ -507,7 +569,7 @@ def main():
         getattr(target_cfg.text_config, "num_experts", None),
         getattr(target_cfg.vision_config, "num_experts", None),
     )
-    target_model = Flex_Qwen2_5_VLMoeForConditionalGeneration(target_cfg)
+    target_model = Flex_Qwen2_5_VLMoeForConditionalGeneration(target_cfg).to(device=device, dtype=dtype)
     target_sd = target_model.state_dict()
     base_sd = source_sds[args.base_model_index]
 
@@ -573,8 +635,12 @@ def main():
     target_model.load_state_dict(target_sd, strict=True)
 
     log.info(f"Saving merged model to {args.target}")
-    target_model = target_model.to(dtype)
-    target_model.save_pretrained(args.target, safe_serialization=True)
+    target_model = target_model.to(device=device, dtype=dtype)
+    if args.save_on_cpu:
+        save_sd = {k: v.detach().cpu() for k, v in target_model.state_dict().items()}
+        target_model.save_pretrained(args.target, state_dict=save_sd, safe_serialization=True)
+    else:
+        target_model.save_pretrained(args.target, safe_serialization=True)
     target_cfg.save_pretrained(args.target)
 
     tokenizer_source = args.tokenizer if args.tokenizer is not None else args.models[args.base_model_index]

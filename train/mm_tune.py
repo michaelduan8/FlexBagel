@@ -24,7 +24,7 @@ from trl import SFTTrainer, SFTConfig
 from modeling.flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration
 from torch.optim import AdamW
 from safetensors.torch import load_file, save_file
-
+from datasets import Value
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 _ORIG_GETEXIF = PILImage.Image.getexif
@@ -33,28 +33,82 @@ def has_xpu():
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def _select_xpu_device_for_current_rank(local_rank: int):
+    """
+    Select the visible XPU device inside the current process.
+
+    Important for Aurora:
+      - FLAT without affinity mask: process may see 12 tile devices.
+      - COMPOSITE without affinity mask: process may see 6 full GPU devices.
+      - gpu_dev_compact.sh / gpu_tile_compact.sh: process is usually masked
+        to one visible device, re-indexed by PyTorch as xpu:0.
+    """
+    if not has_xpu():
+        return None
+
+    n_xpu = torch.xpu.device_count()
+    if n_xpu < 1:
+        raise RuntimeError("torch.xpu.is_available() is True but torch.xpu.device_count() < 1")
+
+    # If affinity wrapper masked this process to one GPU/card or tile,
+    # the only valid PyTorch device id is 0.
+    xpu_id = local_rank % n_xpu
+
+    torch.xpu.set_device(xpu_id)
+
+    # For logging/debugging. Do not use this as distributed local rank.
+    os.environ["AURORA_VISIBLE_XPU_DEVICE"] = str(xpu_id)
+
+    # This is a useful guard for libraries that honor it.
+    # If ignored, it is harmless.
+    os.environ.setdefault("ACCELERATE_TORCH_DEVICE", f"xpu:{xpu_id}")
+
+    return xpu_id
+
+
 def setup_aurora_distributed_env():
     """
-    Minimal Aurora/PALS -> PyTorch distributed env bridge.
+    Aurora/PALS -> PyTorch distributed env bridge.
 
-    Use this with:
-      mpiexec --pmi=pmix --envall -n <total_ranks> --ppn 12 python mm_tune.py ...
+    For COMPOSITE + gpu_dev_compact.sh:
+      - each rank is masked to one visible GPU/card
+      - torch.xpu.device_count() is usually 1
+      - DeepSpeed must see LOCAL_RANK=0, not PALS_LOCAL_RANKID
     """
 
-    # oneCCL/Aurora defaults. These must be set before torch distributed init.
     os.environ.setdefault("CCL_PROCESS_LAUNCHER", "pmix")
     os.environ.setdefault("CCL_ATL_TRANSPORT", "mpi")
     os.environ.setdefault("CCL_KVS_MODE", "mpi")
     os.environ.setdefault("FI_MR_CACHE_MONITOR", "userfaultfd")
 
-    # If not launched by Aurora/PALS, keep normal single-process / torchrun behavior.
+    # Non-PALS / torchrun path
     if "PALS_LOCAL_RANKID" not in os.environ:
         if "LOCAL_RANK" in os.environ:
+            original_local_rank = int(os.environ["LOCAL_RANK"])
+
             os.environ.setdefault("CCL_PROCESS_LAUNCHER", "torchrun")
-            os.environ.setdefault("CCL_LOCAL_RANK", os.environ["LOCAL_RANK"])
+            os.environ.setdefault("CCL_LOCAL_RANK", str(original_local_rank))
             os.environ.setdefault("CCL_LOCAL_SIZE", os.environ.get("LOCAL_WORLD_SIZE", "1"))
+
             if has_xpu():
-                torch.xpu.set_device(int(os.environ["LOCAL_RANK"]))
+                n_xpu = torch.xpu.device_count()
+                visible_local_rank = original_local_rank % n_xpu
+
+                # Important: overwrite LOCAL_RANK to visible device index.
+                os.environ["ORIGINAL_LOCAL_RANK"] = str(original_local_rank)
+                os.environ["LOCAL_RANK"] = str(visible_local_rank)
+
+                torch.xpu.set_device(visible_local_rank)
+
+                print(
+                    f"[torchrun-ddp] original_local_rank={original_local_rank} "
+                    f"LOCAL_RANK_for_deepspeed={visible_local_rank} "
+                    f"xpu_count={n_xpu} "
+                    f"current_xpu={torch.xpu.current_device()} "
+                    f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK')} "
+                    f"ZE_FLAT_DEVICE_HIERARCHY={os.environ.get('ZE_FLAT_DEVICE_HIERARCHY')}",
+                    flush=True,
+                )
         return
 
     from mpi4py import MPI
@@ -64,17 +118,39 @@ def setup_aurora_distributed_env():
     rank = comm.Get_rank()
     world_size = comm.Get_size()
 
-    local_rank = int(os.environ["PALS_LOCAL_RANKID"])
+    pals_local_rank = int(os.environ["PALS_LOCAL_RANKID"])
     local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
     local_world_size = local_comm.Get_size()
 
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
 
-    # oneCCL also likes these explicitly available.
-    os.environ["CCL_LOCAL_RANK"] = str(local_rank)
+    # Preserve true node-local process rank.
+    os.environ["PALS_TRUE_LOCAL_RANK"] = str(pals_local_rank)
+    os.environ["AURORA_PALS_LOCAL_RANK"] = str(pals_local_rank)
+
+    if has_xpu():
+        n_xpu = torch.xpu.device_count()
+        if n_xpu < 1:
+            raise RuntimeError("torch.xpu.is_available() is True but device_count() < 1")
+
+        # With gpu_dev_compact.sh + COMPOSITE, n_xpu is usually 1.
+        # Therefore every process should use visible xpu:0.
+        visible_local_rank = pals_local_rank % n_xpu
+
+        # Critical: set this BEFORE DeepSpeed/Accelerate reads it.
+        os.environ["LOCAL_RANK"] = str(visible_local_rank)
+        os.environ["AURORA_VISIBLE_XPU_COUNT"] = str(n_xpu)
+
+        torch.xpu.set_device(visible_local_rank)
+    else:
+        n_xpu = 0
+        visible_local_rank = pals_local_rank
+        os.environ["LOCAL_RANK"] = str(visible_local_rank)
+
+    # Keep CCL_LOCAL_RANK as true process-local rank.
+    os.environ["CCL_LOCAL_RANK"] = str(pals_local_rank)
     os.environ["CCL_LOCAL_SIZE"] = str(local_world_size)
 
     if "MASTER_ADDR" not in os.environ:
@@ -84,12 +160,15 @@ def setup_aurora_distributed_env():
 
     os.environ.setdefault("MASTER_PORT", "2345")
 
-    if has_xpu():
-        torch.xpu.set_device(local_rank)
-
     print(
         f"[aurora-ddp] rank={rank}/{world_size} "
-        f"local_rank={local_rank}/{local_world_size} "
+        f"pals_local_rank={pals_local_rank}/{local_world_size} "
+        f"LOCAL_RANK_for_deepspeed={os.environ['LOCAL_RANK']} "
+        f"CCL_LOCAL_RANK={os.environ['CCL_LOCAL_RANK']} "
+        f"xpu_count={torch.xpu.device_count() if has_xpu() else 'NA'} "
+        f"current_xpu={torch.xpu.current_device() if has_xpu() else 'NA'} "
+        f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK')} "
+        f"ZE_FLAT_DEVICE_HIERARCHY={os.environ.get('ZE_FLAT_DEVICE_HIERARCHY')} "
         f"master={os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
         flush=True,
     )
@@ -444,9 +523,10 @@ def preprocess_dataset(dataset):
         #     print(f"Error processing image bytes for item {item['id']}: {e}")
 
         id = item["id"] if "id" in item else idx
+        prompt_id = None if id is None else str(id)
+
         conversation = item["conversation"]
         assert conversation[-1]["role"] == "assistant"
-        # assert len(conversation) <= 3
 
         images = item[image_key]
 
@@ -456,9 +536,6 @@ def preprocess_dataset(dataset):
         for turn in conversation[:-1]:
             content = [{"type": "text", "text": turn["content"]}]
 
-            # Minimal multi-turn support:
-            # If a user turn has img_loc, attach the top-level images only once.
-            # This avoids duplicating image placeholders across multiple user turns.
             if (
                 turn["role"] == "user"
                 and turn.get("img_loc") is not None
@@ -475,35 +552,26 @@ def preprocess_dataset(dataset):
             prompt.append({"role": turn["role"], "content": content})
 
         return {
-            "prompt_id": id,
+            "prompt_id": prompt_id,
             "prompt": prompt,
-            "completion": [{"role": "assistant", "content": [{"type": "text", "text": conversation[-1]["content"]}]}],
-            # TODO: could be ok to not have images?
-            # "images": [{"bytes": b, "path": None} for b in rgb_bytes] if rgb_bytes else None,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": conversation[-1]["content"],
+                        }
+                    ],
+                }
+            ],
             "images": [{"bytes": None, "path": img_path} for img_path in images] if images else None,
         }
 
     #dataset = dataset.map(load_bytes, num_proc=24)
     dataset = dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=12, with_indices=True).filter(lambda x: x["images"] is not None)
     dataset = dataset.cast_column("images", Sequence(Image()))
-
-    # widths_kept = [w for row in dataset["image_widths"] for w in row]
-    # heights_kept = [h for row in dataset["image_heights"] for h in row]
-    # sizes_kept = [s for row in dataset["image_sizes"] for s in row]
-    # if len(widths_kept) > 0 and len(heights_kept) > 0:
-    #     avg_width_kept = float(np.mean(widths_kept))
-    #     std_width_kept = float(np.std(widths_kept))
-    #     avg_height_kept = float(np.mean(heights_kept))
-    #     std_height_kept = float(np.std(heights_kept))
-    #     avg_size_kept = float(np.mean(sizes_kept))
-    #     std_size_kept = float(np.std(sizes_kept))
-    #     print(
-    #         "Image dimension stats (kept images): "
-    #         f"n={len(widths_kept)}, "
-    #         f"width_avg={avg_width_kept:.1f}px, width_std={std_width_kept:.1f}px, "
-    #         f"height_avg={avg_height_kept:.1f}px, height_std={std_height_kept:.1f}px, "
-    #         f"size_avg={avg_size_kept:.2f}MB, size_std={std_size_kept:.2f}MB"
-    #     )
+    dataset = dataset.cast_column("prompt_id", Value("string"))
 
     return dataset
 
@@ -1308,29 +1376,29 @@ def main():
         print("Freezing all weights except router gate weights.")
         freeze_all_except_router(model)
         model.enable_input_require_grads() # Need this to still build computational graph?
-        print_trainable_parameters(model)
+        # print_trainable_parameters(model)
     elif sft_args.train_expert_idx is not None:
         print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
               f"({'LoRA adapters' if sft_args.use_lora else 'full fine-tune'}).")
-        print_trainable_parameters(model)
+        # print_trainable_parameters(model)
         freeze_all_except_expert(
             model,
             expert_idx=sft_args.train_expert_idx,
             use_lora=sft_args.use_lora,
         )
         print("After freezing expert:")
-        print_trainable_parameters(model)
+        # print_trainable_parameters(model)
         model.enable_input_require_grads() # Need this to still build computational graph?
 
     if sft_args.unfreeze_attn:
         raise NotImplementedError("unfreeze_attn is not implemented for mm_tune.py")
         print("unfreeze_attn=True: unfreezing attention layers.")
-        unfreeze_attention_layers(model)
+        # unfreeze_attention_layers(model)
 
     if sft_args.unfreeze_embed:
         raise NotImplementedError("unfreeze_embed is not implemented for mm_tune.py")
         print("unfreeze_embed=True: unfreezing embedding layers.")
-        unfreeze_embedding_layers(model)
+        # unfreeze_embedding_layers(model)
 
     # ------------------------------------------------------------------
     # LoRA setup

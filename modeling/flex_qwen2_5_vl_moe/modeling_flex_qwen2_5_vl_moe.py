@@ -36,12 +36,38 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
+from torch.utils.checkpoint import checkpoint
 from .configuration_flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeTextConfig, Flex_Qwen2_5_VLMoeVisionConfig
 
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.profiler import profile, ProfilerActivity
 
 logger = logging.get_logger(__name__)
+
+def _manual_checkpoint(module, fn, *args):
+    gc_func = getattr(module, "_gradient_checkpointing_func", None)
+    if gc_func is not None:
+        return gc_func(fn, *args)
+    return checkpoint(fn, *args, use_reentrant=False)
+
+
+def enable_split_checkpointing_for_moe_layers(model):
+    n = 0
+    for name, module in model.named_modules():
+        if (
+            hasattr(module, "mlp")
+            and isinstance(module.mlp, Flex_Qwen2_5_VLMoeSparseMoeBlock)
+        ):
+            # Disable HF whole-layer checkpointing.
+            module.gradient_checkpointing = False
+
+            # Enable our manual attention-only checkpointing.
+            module.attn_gradient_checkpointing = True
+
+            n += 1
+            print(f"[SPLIT GC] whole-layer GC off, attention-only GC on: {name}")
+
+    print(f"[SPLIT GC] patched {n} MoE parent layers")
 
 
 def load_balancing_loss_func(
@@ -169,13 +195,28 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        if False:
-            random_scores = torch.rand_like(routing_weights)
-            selected_experts = torch.argsort(random_scores, dim=-1, descending=True)[:, : self.top_k]
-            routing_weights = routing_weights.new_full(selected_experts.shape, 1.0 / self.top_k)
-        else:
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        router_logits_fp32 = router_logits.float()
+
+        # Deterministic expert-id tie breaker.
+        # Small enough not to materially change routing unless experts are tied/nearly tied.
+        tie_break = (
+            torch.arange(self.num_experts, device=router_logits.device, dtype=router_logits_fp32.dtype)
+            * 1e-3
+        )
+
+        topk_scores, selected_experts = torch.topk(
+            router_logits_fp32 + tie_break,
+            self.top_k,
+            dim=-1,
+        )
+
+        routing_probs = F.softmax(router_logits_fp32, dim=-1)
+        routing_weights = routing_probs.gather(1, selected_experts)
+
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+        routing_weights = routing_weights.to(hidden_states.dtype)
         # if self.top_k == 1:
         #     routing_weights = torch.ones_like(routing_weights)
         # el
@@ -625,17 +666,36 @@ class Flex_Qwen2_5_VLMoeVisionBlock(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and getattr(self, "attn_gradient_checkpointing", False)
+        ):
+            def attn_forward(x):
+                return self.attn(
+                    self.norm1(x),
+                    cu_seqlens=cu_seqlens,
+                    rotary_pos_emb=rotary_pos_emb,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
 
+            attn_out = _manual_checkpoint(self, attn_forward, hidden_states)
+        else:
+            attn_out = self.attn(
+                self.norm1(hidden_states),
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        hidden_states = hidden_states + attn_out
+
+        # DO NOT checkpoint this part for sparse MoE
         residual = hidden_states
-
         hidden_states = self.mlp(self.norm2(hidden_states))
+
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states
         else:
@@ -1102,23 +1162,46 @@ class Flex_Qwen2_5_VLMoeDecoderLayer(GradientCheckpointingLayer):
 
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and getattr(self, "attn_gradient_checkpointing", False)
+            and not output_attentions
+        ):
+            def attn_forward(x):
+                x = self.input_layernorm(x)
+                attn_out, _ = self.self_attn(
+                    hidden_states=x,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=False,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                return attn_out
 
-        # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+            hidden_states = _manual_checkpoint(self, attn_forward, hidden_states)
+            self_attn_weights = None
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, self_attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # MLP / MoE block, not checkpointed
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -2166,6 +2249,12 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         video_nums = torch.sum(vision_first_mask & video_mask, dim=1)
 
         return image_nums, video_nums
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        super().gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+        )
+        enable_split_checkpointing_for_moe_layers(self)
 
     def _expand_inputs_for_generation(
         self,
