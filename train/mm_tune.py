@@ -258,6 +258,12 @@ class SFTArgs:
         metadata={"help": "If set, freeze all weights except MoE router gate weights across all experts. "
                           "When enabled, train_expert_idx is ignored and forced to None."}
     )
+    unfreeze_all_except_public_moe: bool = field(
+        default=False,
+        metadata={"help": "If set, train all parameters except the public MoE path. "
+                          "In this model, the public path is expert index 0: expert-0 MLP weights are frozen, "
+                          "and router gate row 0 gradients are masked to zero."}
+    )
     unfreeze_attn: bool = field(
         default=False,
         metadata={"help": "If set, unfreeze attention layers after expert/router freezing and before LoRA setup."}
@@ -847,6 +853,60 @@ def freeze_all_except_router(model):
             param.requires_grad = False
 
 
+def freeze_public_router_mlp(
+    model,
+    public_expert_idx: int = 0,
+    verbose: bool = False,
+):
+    """
+    Train the full model except the public expert FFN layers.
+    Router gates are left fully trainable.
+    """
+
+    def is_sparse_moe_block(module):
+        return hasattr(module, "experts") and hasattr(module, "gate")
+
+    for param in model.parameters():
+        param.requires_grad = True
+
+    frozen_names = []
+    num_moe_modules = 0
+
+    for module_name, module in model.named_modules():
+        if not is_sparse_moe_block(module):
+            continue
+
+        num_moe_modules += 1
+
+        if public_expert_idx < 0 or public_expert_idx >= len(module.experts):
+            raise ValueError(
+                f"public_expert_idx={public_expert_idx} is invalid for {module_name}; "
+                f"this block has {len(module.experts)} experts."
+            )
+
+        for pname, param in module.experts[public_expert_idx].named_parameters():
+            param.requires_grad = False
+            full_name = f"{module_name}.experts.{public_expert_idx}.{pname}".lstrip(".")
+            frozen_names.append(full_name)
+            if verbose:
+                print(f"[frozen-public-expert{public_expert_idx}-ffn] {full_name}")
+
+    if num_moe_modules == 0:
+        sample_names = [name for name, _ in list(model.named_parameters())[:40]]
+        raise RuntimeError(
+            "unfreeze_all_except_public_moe=True, but no SparseMoeBlock-like modules "
+            "with `.experts` matched. First parameter names include:\n  "
+            + "\n  ".join(sample_names)
+        )
+
+    if not frozen_names:
+        raise RuntimeError(
+            f"Matched {num_moe_modules} MoE modules, but froze no expert-{public_expert_idx} parameters."
+        )
+
+    return frozen_names
+
+
 # def unfreeze_attention_layers(model):
     # """Unfreeze attention projection parameters by name heuristic."""
     # trainable_count = 0
@@ -1299,11 +1359,26 @@ def main():
     print("Parsed SFTConfig:", sft_config)
     print("SFTArgs:", sft_args)
 
-    if sft_args.router_tuning_only and sft_args.train_expert_idx is not None:
-        raise ValueError("router_tuning_only is incompatible with train_expert_idx because router tuning affects the routing gate of all experts, not just a single expert.")
+    active_freeze_modes = [
+        sft_args.router_tuning_only,
+        sft_args.train_expert_idx is not None,
+        sft_args.unfreeze_all_except_public_moe,
+    ]
+    if sum(bool(mode) for mode in active_freeze_modes) > 1:
+        raise ValueError(
+            "Choose only one freezing mode among router_tuning_only, "
+            "train_expert_idx, and unfreeze_all_except_public_moe."
+        )
 
     if sft_args.router_tuning_only and sft_args.use_lora:
         raise ValueError("router_tuning_only is incompatible with use_lora because LoRA introduces additional trainable parameters.")
+
+    if sft_args.unfreeze_all_except_public_moe and sft_args.use_lora:
+        raise ValueError(
+            "unfreeze_all_except_public_moe is intended for full fine-tuning and is "
+            "incompatible with use_lora, because PEFT would freeze the base model and "
+            "only train adapters."
+        )
 
     # load_dotenv()
 
@@ -1376,6 +1451,12 @@ def main():
         print("Freezing all weights except router gate weights.")
         freeze_all_except_router(model)
         model.enable_input_require_grads() # Need this to still build computational graph?
+        # print_trainable_parameters(model)
+    elif sft_args.unfreeze_all_except_public_moe:
+        print("Unfreezing all weights except public MoE path: expert-0 MLP plus router row 0.")
+        freeze_public_router_mlp(model, public_expert_idx=0)
+        model.enable_input_require_grads()
+        # print("After freezing public expert-0 MLP and masking router row 0:")
         # print_trainable_parameters(model)
     elif sft_args.train_expert_idx is not None:
         print(f"Freezing all weights except expert {sft_args.train_expert_idx} "
@@ -1541,7 +1622,8 @@ def main():
         "gpu_name": get_device_name_for_logging(),
         "initial_gpu_memory_gb": get_memory_allocated_gb_for_logging(),
         "use_lora": sft_args.use_lora,
-        # "router_tuning_only": sft_args.router_tuning_only,
+        "router_tuning_only": sft_args.router_tuning_only,
+        "unfreeze_all_except_public_moe": sft_args.unfreeze_all_except_public_moe,
         # "unfreeze_attn": sft_args.unfreeze_attn,
         # "unfreeze_embed": sft_args.unfreeze_embed,
         **lora_stats,
