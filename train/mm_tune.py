@@ -242,6 +242,11 @@ class SFTArgs:
     save_n_epochs: float = field(default=1.0, metadata={"help": "Save a checkpoint every N epochs"})
     lr_vision: float = field(default=None, metadata={"help": "Learning rate for vision tower"})
     lr_llm: float = field(default=None, metadata={"help": "Learning rate for LLM decoder"})
+    freeze_lm_decoder: bool = field(
+        default=False,
+        metadata={"help": "If set, freeze the language-model decoder parameters so they receive no gradient updates. "
+                          "This also freezes lm_head when present."}
+    )
     lr_connector: float = field(default=None, metadata={"help": "Learning rate for VL connector MLP"})
     filter_by_id: list[str] = field(
         default=None,
@@ -851,6 +856,47 @@ def freeze_all_except_router(model):
             print(f"[trainable-router] {name}")
         else:
             param.requires_grad = False
+
+
+def freeze_lm_decoder_parameters(model, freeze_lm_head: bool = True, verbose: bool = True):
+    """
+    Freeze the language-model decoder path so it receives no optimizer updates.
+
+    This is intentionally a post-processing freeze: call it after other freezing/
+    unfreezing logic and after LoRA injection, so it also disables any trainable
+    adapters inserted under the language_model path.
+    """
+    frozen_names = []
+
+    for name, param in model.named_parameters():
+        is_lm_decoder = (
+            name.startswith("language_model.")
+            or name.startswith("model.language_model.")
+            or ".language_model." in name
+        )
+        is_lm_head = freeze_lm_head and (
+            name == "lm_head.weight"
+            or name.startswith("lm_head.")
+            or name.endswith(".lm_head.weight")
+            or ".lm_head." in name
+        )
+
+        if is_lm_decoder or is_lm_head:
+            if param.requires_grad:
+                frozen_names.append(name)
+            param.requires_grad = False
+
+    if verbose:
+        print(
+            f"[freeze_lm_decoder] frozen trainable params/tensors under language_model"
+            f"{' and lm_head' if freeze_lm_head else ''}: {len(frozen_names)}"
+        )
+        for name in frozen_names[:50]:
+            print(f"[frozen-lm-decoder] {name}")
+        if len(frozen_names) > 50:
+            print(f"[frozen-lm-decoder] ... {len(frozen_names) - 50} more")
+
+    return frozen_names
 
 
 def freeze_public_router_mlp(
@@ -1522,6 +1568,12 @@ def main():
         # Full fine-tune of expert only — just print the parameter count
         print_trainable_parameters(model)
 
+    if sft_args.freeze_lm_decoder:
+        print("freeze_lm_decoder=True: freezing language-model decoder parameters.")
+        freeze_lm_decoder_parameters(model, freeze_lm_head=True)
+        print("After freeze_lm_decoder:")
+        print_trainable_parameters(model)
+
     # ------------------------------------------------------------------
     # Dataset preparation
     # ------------------------------------------------------------------
@@ -1624,6 +1676,7 @@ def main():
         "use_lora": sft_args.use_lora,
         "router_tuning_only": sft_args.router_tuning_only,
         "unfreeze_all_except_public_moe": sft_args.unfreeze_all_except_public_moe,
+        "freeze_lm_decoder": sft_args.freeze_lm_decoder,
         # "unfreeze_attn": sft_args.unfreeze_attn,
         # "unfreeze_embed": sft_args.unfreeze_embed,
         **lora_stats,
