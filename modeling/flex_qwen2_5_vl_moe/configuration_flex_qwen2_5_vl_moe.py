@@ -48,6 +48,7 @@ class Flex_Qwen2_5_VLMoeVisionConfig(PretrainedConfig):
         norm_topk_prob=False,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
+        router_depth_aux_loss_coef=0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -73,6 +74,7 @@ class Flex_Qwen2_5_VLMoeVisionConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_depth_aux_loss_coef = router_depth_aux_loss_coef
 
 
 class Flex_Qwen2_5_VLMoeTextConfig(PretrainedConfig):
@@ -132,6 +134,7 @@ class Flex_Qwen2_5_VLMoeTextConfig(PretrainedConfig):
         norm_topk_prob=False,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
+        router_depth_aux_loss_coef=0.0,
         mlp_only_layers=[],
         **kwargs,
     ):
@@ -190,6 +193,7 @@ class Flex_Qwen2_5_VLMoeTextConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_depth_aux_loss_coef = router_depth_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)

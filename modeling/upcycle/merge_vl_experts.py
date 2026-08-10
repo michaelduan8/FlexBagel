@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModelForConditionalGeneration, AutoProcessor, AutoTokenizer
 
 # Adjust this import if your file name/module path is different.
 # It should point to the file that defines Flex_Qwen2_5_VLMoeForConditionalGeneration.
@@ -100,6 +100,25 @@ def parse_args():
         "--strict-shared-check",
         action="store_true",
         help="Fail if shared/non-expert tensors differ across models. Default is warn-only.",
+    )
+    parser.add_argument(
+        "--merge-non-ffn-weights",
+        action="store_true",
+        help=(
+            "Average floating-point shared non-FFN tensors across the selected expert sources "
+            "that are being merged. If one source model contributes multiple selected experts, "
+            "its shared weights are counted once per selected expert. Dense/shared FFN tensors are still copied from "
+            "--base-model-index."
+        ),
+    )
+    parser.add_argument(
+        "--non-ffn-seeds",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional checkpoint paths/HF IDs to use as the averaging pool for shared non-FFN tensors. "
+            "When omitted, shared non-FFN tensors are averaged across the selected expert sources from --models."
+        ),
     )
     parser.add_argument(
         "--merge-text",
@@ -255,9 +274,62 @@ def _assert_or_warn_equal(
             log.warning(msg)
 
 
+def get_selected_model_indices(merged_sources: list[ExpertSource]) -> list[int]:
+    return [src.model_idx for src in merged_sources]
+
+
+def is_ffn_key(key: str) -> bool:
+    return ".mlp." in key
+
+
+def merge_shared_weight(
+    key: str,
+    target_tensor: torch.Tensor,
+    source_sds: list[dict[str, torch.Tensor]],
+) -> torch.Tensor:
+    source_tensors: list[torch.Tensor] = []
+    for model_idx, sd in enumerate(source_sds):
+        src_tensor = sd.get(key)
+        if src_tensor is None:
+            raise KeyError(f"Missing shared tensor for key {key!r} in source model {model_idx}")
+        if src_tensor.shape != target_tensor.shape:
+            raise ValueError(
+                f"Shared tensor shape mismatch for {key}: source model {model_idx} has {tuple(src_tensor.shape)} "
+                f"vs target {tuple(target_tensor.shape)}"
+            )
+        source_tensors.append(src_tensor)
+
+    ref_tensor = source_tensors[0]
+    if not torch.is_floating_point(ref_tensor):
+        return ref_tensor.clone().to(dtype=target_tensor.dtype)
+
+    merged_tensor = torch.zeros_like(ref_tensor, dtype=torch.float32)
+    for src_tensor in source_tensors:
+        merged_tensor.add_(src_tensor.to(dtype=torch.float32))
+
+    merged_tensor.div_(len(source_tensors))
+    return merged_tensor.to(dtype=target_tensor.dtype)
+
+
+def register_local_architectures() -> None:
+    try:
+        AutoConfig.register("flex_qwen2_5_vl_moe", Flex_Qwen2_5_VLMoeConfig)
+    except ValueError:
+        pass
+
+    try:
+        AutoModelForConditionalGeneration.register(
+            Flex_Qwen2_5_VLMoeConfig,
+            Flex_Qwen2_5_VLMoeForConditionalGeneration,
+        )
+    except ValueError:
+        pass
+
+
 def load_vlmoe(path: str, dtype: torch.dtype, trust_remote_code: bool):
+    register_local_architectures()
     log.info(f"Loading VLMoE model: {path}")
-    model = Flex_Qwen2_5_VLMoeForConditionalGeneration.from_pretrained(
+    model = AutoModelForConditionalGeneration.from_pretrained(
         path,
         torch_dtype=dtype,
         trust_remote_code=trust_remote_code,
@@ -288,6 +360,7 @@ def validate_compatible_configs(
     cfgs: list[Flex_Qwen2_5_VLMoeConfig],
     merge_text: bool,
     merge_vision: bool,
+    require_matching_num_experts: bool = True,
 ):
     # Do not include num_experts here; it is intentionally changed in the target.
     text_fields = [
@@ -339,11 +412,12 @@ def validate_compatible_configs(
             if hasattr(cfgs[0].vision_config, field):
                 require_same_attr(cfgs, f"vision_config.{field}")
 
-    # Source expert counts must match across source checkpoints for each merged component.
-    if merge_text:
-        require_same_attr(cfgs, "text_config.num_experts")
-    if merge_vision:
-        require_same_attr(cfgs, "vision_config.num_experts")
+    if require_matching_num_experts:
+        # Source expert counts must match across source checkpoints for each merged component.
+        if merge_text:
+            require_same_attr(cfgs, "text_config.num_experts")
+        if merge_vision:
+            require_same_attr(cfgs, "vision_config.num_experts")
 
 
 def infer_num_source_experts(
@@ -458,10 +532,32 @@ def main():
         source_sds.append(sd)
         source_cfgs.append(cfg)
 
+    non_ffn_source_sds = source_sds
+    non_ffn_source_cfgs = source_cfgs
+    if args.non_ffn_seeds is not None:
+        non_ffn_source_sds = []
+        non_ffn_source_cfgs = []
+        for p in args.non_ffn_seeds:
+            sd, cfg = load_vlmoe(p, dtype=dtype, trust_remote_code=args.trust_remote_code)
+            non_ffn_source_sds.append(sd)
+            non_ffn_source_cfgs.append(cfg)
+
     base_cfg = source_cfgs[args.base_model_index]
 
     # 2) Validate that non-expert architecture is compatible.
     validate_compatible_configs(source_cfgs, merge_text=args.merge_text, merge_vision=args.merge_vision)
+    validate_compatible_configs(
+        non_ffn_source_cfgs,
+        merge_text=args.merge_text,
+        merge_vision=args.merge_vision,
+        require_matching_num_experts=False,
+    )
+    validate_compatible_configs(
+        [base_cfg, *non_ffn_source_cfgs],
+        merge_text=args.merge_text,
+        merge_vision=args.merge_vision,
+        require_matching_num_experts=False,
+    )
 
     num_source_experts = infer_num_source_experts(base_cfg, merge_text=args.merge_text, merge_vision=args.merge_vision)
     if not (0 <= args.shared_expert_index < num_source_experts):
@@ -489,9 +585,22 @@ def main():
     if merged_num_experts < 1:
         raise ValueError("Merged model must have at least one expert.")
 
+    selected_model_indices = get_selected_model_indices(merged_sources)
+
     log.info("Merged expert mapping (merged_idx -> src_model:src_expert):")
     for merged_idx, src in enumerate(merged_sources):
         log.info(f"  {merged_idx} -> {src.model_idx}:{src.expert_idx}")
+    if args.merge_non_ffn_weights:
+        if args.non_ffn_seeds is None:
+            log.info(
+                "Averaging floating-point shared non-FFN tensors across selected expert sources from models: %s",
+                selected_model_indices,
+            )
+        else:
+            log.info(
+                "Averaging floating-point shared non-FFN tensors across explicit --non-ffn-seeds: %s",
+                args.non_ffn_seeds,
+            )
 
     # 4) Create target config/model skeleton.
     target_cfg = copy.deepcopy(base_cfg)
@@ -545,12 +654,19 @@ def main():
         # Everything else is non-expert/shared: embeddings, attention, norms, dense MLP,
         # visual patch embed/merger, lm_head, etc. Use base model, optionally check equality.
         if key in base_sd:
-            _assert_or_warn_equal(key, source_sds, strict=args.strict_shared_check)
-            if base_sd[key].shape != target_sd[key].shape:
-                raise ValueError(
-                    f"Shared tensor shape mismatch for {key}: base {tuple(base_sd[key].shape)} vs target {tuple(target_sd[key].shape)}"
-                )
-            target_sd[key] = base_sd[key].clone().to(dtype=target_sd[key].dtype)
+            if args.merge_non_ffn_weights and not is_ffn_key(key):
+                if args.non_ffn_seeds is None:
+                    selected_non_ffn_sds = [source_sds[model_idx] for model_idx in selected_model_indices]
+                else:
+                    selected_non_ffn_sds = non_ffn_source_sds
+                target_sd[key] = merge_shared_weight(key, target_sd[key], selected_non_ffn_sds)
+            else:
+                _assert_or_warn_equal(key, source_sds, strict=args.strict_shared_check)
+                if base_sd[key].shape != target_sd[key].shape:
+                    raise ValueError(
+                        f"Shared tensor shape mismatch for {key}: base {tuple(base_sd[key].shape)} vs target {tuple(target_sd[key].shape)}"
+                    )
+                target_sd[key] = base_sd[key].clone().to(dtype=target_sd[key].dtype)
             copied_shared += 1
         else:
             # This should be rare. For correctness, report it so you know something

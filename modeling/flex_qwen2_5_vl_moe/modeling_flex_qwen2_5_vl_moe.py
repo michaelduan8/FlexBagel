@@ -91,6 +91,99 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
+def collect_depth_routing_kl_terms(
+    router_tensors: Union[tuple[torch.Tensor], None],
+    token_mask: Optional[torch.Tensor] = None,
+    tensors_are_logits: bool = True,
+    eps: float = 1e-8,
+) -> list[torch.Tensor]:
+    if router_tensors is None or len(router_tensors) < 2:
+        return []
+
+    normalized_tensors = []
+    for router_tensor in router_tensors:
+        if router_tensor is None:
+            continue
+        if tensors_are_logits:
+            normalized_tensors.append(F.softmax(router_tensor, dim=-1, dtype=torch.float32))
+        else:
+            normalized_tensors.append(router_tensor.to(torch.float32))
+
+    if len(normalized_tensors) < 2:
+        return []
+
+    flat_token_mask = None
+    if token_mask is not None:
+        flat_token_mask = token_mask.reshape(-1).to(dtype=torch.bool, device=normalized_tensors[0].device)
+
+    losses = []
+    for previous_router, next_router in zip(normalized_tensors[:-1], normalized_tensors[1:]):
+        if flat_token_mask is not None:
+            previous_router = previous_router[flat_token_mask]
+            next_router = next_router[flat_token_mask]
+
+        if previous_router.shape[0] == 0:
+            continue
+
+        previous_router = previous_router.clamp_min(eps)
+        next_router = next_router.clamp_min(eps)
+        losses.append(F.kl_div(previous_router.log(), next_router, reduction="batchmean"))
+
+    return losses
+
+
+def boundary_routing_consistency_loss(
+    vision_router_probs: Union[tuple[torch.Tensor], None],
+    text_router_logits: Optional[torch.Tensor],
+    text_token_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> Optional[torch.Tensor]:
+    if vision_router_probs is None or len(vision_router_probs) == 0 or text_router_logits is None:
+        return None
+
+    vision_last_router_probs = vision_router_probs[-1].to(torch.float32)
+    text_first_router_probs = F.softmax(text_router_logits, dim=-1, dtype=torch.float32)
+    flat_text_token_mask = text_token_mask.reshape(-1).to(dtype=torch.bool, device=text_first_router_probs.device)
+    text_first_router_probs = text_first_router_probs[flat_text_token_mask]
+
+    if text_first_router_probs.shape[0] == 0:
+        return None
+
+    if vision_last_router_probs.shape != text_first_router_probs.shape:
+        raise ValueError(
+            "Vision/text boundary routing tensors are misaligned: "
+            f"vision={tuple(vision_last_router_probs.shape)}, text={tuple(text_first_router_probs.shape)}"
+        )
+
+    vision_last_router_probs = vision_last_router_probs.clamp_min(eps)
+    text_first_router_probs = text_first_router_probs.clamp_min(eps)
+    return F.kl_div(vision_last_router_probs.log(), text_first_router_probs, reduction="batchmean")
+
+
+def pool_vision_router_probs_to_merged_tokens(
+    router_logits: Union[tuple[torch.Tensor], None],
+    spatial_merge_unit: int,
+    reverse_indices: torch.Tensor,
+) -> Optional[tuple[torch.Tensor]]:
+    if router_logits is None or len(router_logits) == 0:
+        return None
+
+    pooled_router_probs = []
+    for layer_router_logits in router_logits:
+        num_tokens, num_experts = layer_router_logits.shape
+        if num_tokens % spatial_merge_unit != 0:
+            raise ValueError(
+                f"Vision router logits token count {num_tokens} is not divisible by spatial merge unit {spatial_merge_unit}."
+            )
+
+        merged_router_probs = F.softmax(layer_router_logits, dim=-1, dtype=torch.float32)
+        merged_router_probs = merged_router_probs.reshape(num_tokens // spatial_merge_unit, spatial_merge_unit, num_experts)
+        merged_router_probs = merged_router_probs.mean(dim=1)
+        pooled_router_probs.append(merged_router_probs[reverse_indices])
+
+    return tuple(pooled_router_probs)
+
+
 def _validate_visual_router_token_count(
     router_logits: tuple[torch.Tensor] | None,
     grid_thw: Optional[torch.LongTensor],
@@ -100,7 +193,8 @@ def _validate_visual_router_token_count(
     if router_logits is None or grid_thw is None or len(router_logits) == 0:
         return
 
-    expected_token_count = int((grid_thw.prod(-1) // (spatial_merge_size**2)).sum().item())
+    # Vision MoE blocks route tokens before patch merger reduces spatial tokens.
+    expected_token_count = int(grid_thw.prod(-1).sum().item())
     if expected_token_count == 0:
         return
 
@@ -146,7 +240,7 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         # self.shared_expert = Flex_Qwen2_5_VLMoeMLP(config, intermediate_size=config.shared_expert_intermediate_size, bias=bias)
         # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # (batchsize, num_tokens, hidden_size)
         """ """
         if hidden_states.ndim == 2:
             original_ndim = 2
@@ -161,9 +255,11 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         else:
             raise ValueError(f"Expected 2D or 3D hidden_states, got {hidden_states.shape}")
         # batch_size, sequence_length, hidden_dim = hidden_states.shape
+        # hidden_states: (batch * sequence_length, hidden_dim)
+        # concat i=1->n (batch i x sequence length, hidden dim)
         hidden_states = hidden_states.reshape(-1, hidden_dim)  # changed from view -> reshape
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+        router_logits = self.gate(hidden_states) 
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         if False:
@@ -664,6 +760,7 @@ class Flex_Qwen2_5_VLMoeVisionTransformerPretrainedModel(Flex_Qwen2_5_VLMoePreTr
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
         output_router_logits: Optional[bool] = None,
+        return_depth_router_probs: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -709,7 +806,8 @@ class Flex_Qwen2_5_VLMoeVisionTransformerPretrainedModel(Flex_Qwen2_5_VLMoePreTr
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
-        all_router_logits = () if output_router_logits else None
+        collect_router_logits = output_router_logits or return_depth_router_probs
+        all_router_logits = () if collect_router_logits else None
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
@@ -724,14 +822,22 @@ class Flex_Qwen2_5_VLMoeVisionTransformerPretrainedModel(Flex_Qwen2_5_VLMoePreTr
                 **kwargs,
             )
 
-            if output_router_logits and router_logits is not None:
+            if collect_router_logits and router_logits is not None:
                 all_router_logits += (router_logits,)
 
         hidden_states = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
 
-        return hidden_states, all_router_logits
+        depth_router_probs = None
+        if return_depth_router_probs:
+            depth_router_probs = pool_vision_router_probs_to_merged_tokens(
+                all_router_logits,
+                self.spatial_merge_unit,
+                reverse_indices,
+            )
+
+        return hidden_states, all_router_logits if output_router_logits else None, depth_router_probs
 
 
 @dataclass
@@ -758,6 +864,8 @@ class Flex_Qwen2_5_VLMoeModelOutputWithPast(ModelOutput):
     attentions: Optional[tuple[torch.FloatTensor]] = None
     router_logits: tuple[torch.FloatTensor] | None = None
     vision_router_logits: tuple[torch.FloatTensor] | None = None
+    image_depth_router_probs: tuple[torch.FloatTensor] | None = None
+    video_depth_router_probs: tuple[torch.FloatTensor] | None = None
     rope_deltas: Optional[torch.LongTensor] = None
 
 
@@ -1424,6 +1532,7 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
         pixel_values_videos: torch.FloatTensor,
         video_grid_thw: Optional[torch.LongTensor] = None,
         output_router_logits: bool = False,
+        return_depth_router_probs: bool = False,
     ):
         """
         Encodes videos into continuous embeddings that can be forwarded to the language model.
@@ -1435,10 +1544,11 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
                 The temporal, height and width of feature shape of each video in LLM.
         """
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-        video_embeds, router_logits = self.visual(
+        video_embeds, router_logits, depth_router_probs = self.visual(
             pixel_values_videos,
             grid_thw=video_grid_thw,
             output_router_logits=output_router_logits,
+            return_depth_router_probs=return_depth_router_probs,
         )
         _validate_visual_router_token_count(
             router_logits,
@@ -1448,6 +1558,8 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
         )
         split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         video_embeds = torch.split(video_embeds, split_sizes)
+        if return_depth_router_probs:
+            return video_embeds, router_logits, depth_router_probs
         return video_embeds, router_logits
 
     def get_image_features(
@@ -1455,6 +1567,7 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
         pixel_values: torch.FloatTensor,
         image_grid_thw: Optional[torch.LongTensor] = None,
         output_router_logits: bool = False,
+        return_depth_router_probs: bool = False,
     ):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model.
@@ -1466,10 +1579,11 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds, router_logits = self.visual(
+        image_embeds, router_logits, depth_router_probs = self.visual(
             pixel_values,
             grid_thw=image_grid_thw,
             output_router_logits=output_router_logits,
+            return_depth_router_probs=return_depth_router_probs,
         )
         _validate_visual_router_token_count(
             router_logits,
@@ -1479,6 +1593,8 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
         )
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
+        if return_depth_router_probs:
+            return image_embeds, router_logits, depth_router_probs
         return image_embeds, router_logits
 
     def get_placeholder_mask(
@@ -1568,16 +1684,24 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
             text_output_router_logits = self.config.text_config.output_router_logits
 
         vision_router_logits = () if vision_output_router_logits else None
+        collect_vision_depth_router_probs = getattr(self.config.vision_config, "router_depth_aux_loss_coef", 0.0) > 0
+        image_depth_router_probs = None
+        video_depth_router_probs = None
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
-            image_embeds, image_router_logits = self.get_image_features(
+            image_feature_outputs = self.get_image_features(
                 pixel_values,
                 image_grid_thw,
                 output_router_logits=vision_output_router_logits,
+                return_depth_router_probs=collect_vision_depth_router_probs,
             )
+            if collect_vision_depth_router_probs:
+                image_embeds, image_router_logits, image_depth_router_probs = image_feature_outputs
+            else:
+                image_embeds, image_router_logits = image_feature_outputs
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -1587,11 +1711,16 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
                 vision_router_logits += image_router_logits
 
         if pixel_values_videos is not None:
-            video_embeds, video_router_logits = self.get_video_features(
+            video_feature_outputs = self.get_video_features(
                 pixel_values_videos,
                 video_grid_thw,
                 output_router_logits=vision_output_router_logits,
+                return_depth_router_probs=collect_vision_depth_router_probs,
             )
+            if collect_vision_depth_router_probs:
+                video_embeds, video_router_logits, video_depth_router_probs = video_feature_outputs
+            else:
+                video_embeds, video_router_logits = video_feature_outputs
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -1655,6 +1784,8 @@ class Flex_Qwen2_5_VLMoeModel(Flex_Qwen2_5_VLMoePreTrainedModel):
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             vision_router_logits=vision_router_logits,
+            image_depth_router_probs=image_depth_router_probs,
+            video_depth_router_probs=video_depth_router_probs,
             rope_deltas=self.rope_deltas,
         )
         return output if return_dict else output.to_tuple()
@@ -1684,6 +1815,7 @@ class Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     aux_loss: torch.FloatTensor | None = None
+    depth_aux_loss: torch.FloatTensor | None = None
     logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[list[torch.FloatTensor]] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
@@ -1720,12 +1852,28 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         return self.model.get_decoder()
 
     def get_video_features(
-        self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        return_depth_router_probs: bool = False,
     ):
-        return self.model.get_video_features(pixel_values_videos, video_grid_thw)
+        return self.model.get_video_features(
+            pixel_values_videos,
+            video_grid_thw,
+            return_depth_router_probs=return_depth_router_probs,
+        )
 
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
-        return self.model.get_image_features(pixel_values, image_grid_thw)
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        return_depth_router_probs: bool = False,
+    ):
+        return self.model.get_image_features(
+            pixel_values,
+            image_grid_thw,
+            return_depth_router_probs=return_depth_router_probs,
+        )
 
     # Make modules available throught conditional class for BC
     @property
@@ -1808,14 +1956,26 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        output_router_logits = kwargs.get("output_router_logits", None)
-        vision_output_router_logits = kwargs.get("vision_output_router_logits", output_router_logits)
-        text_output_router_logits = kwargs.get("text_output_router_logits", output_router_logits)
+        output_router_logits = kwargs.pop("output_router_logits", None)
+        vision_output_router_logits = kwargs.pop("vision_output_router_logits", output_router_logits)
+        text_output_router_logits = kwargs.pop("text_output_router_logits", output_router_logits)
 
         if vision_output_router_logits is None:
             vision_output_router_logits = self.config.vision_config.output_router_logits
         if text_output_router_logits is None:
             text_output_router_logits = self.config.text_config.output_router_logits
+
+        text_router_aux_loss_coef = getattr(self.config.text_config, "router_aux_loss_coef", 0.0)
+        vision_router_aux_loss_coef = getattr(self.config.vision_config, "router_aux_loss_coef", 0.0)
+        text_router_depth_aux_loss_coef = getattr(self.config.text_config, "router_depth_aux_loss_coef", 0.0)
+        vision_router_depth_aux_loss_coef = getattr(self.config.vision_config, "router_depth_aux_loss_coef", 0.0)
+
+        collect_text_router_logits = (
+            text_output_router_logits and (text_router_aux_loss_coef > 0 or text_router_depth_aux_loss_coef > 0)
+        )
+        collect_vision_router_logits = (
+            vision_output_router_logits and (vision_router_aux_loss_coef > 0 or vision_router_depth_aux_loss_coef > 0)
+        )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -1833,6 +1993,8 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
             output_hidden_states=output_hidden_states,
             return_dict=True,
             cache_position=cache_position,
+            vision_output_router_logits=collect_vision_router_logits,
+            text_output_router_logits=collect_text_router_logits,
             **kwargs,
         )
 
@@ -1850,7 +2012,7 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         
         aux_loss = None
         weighted_aux_loss = None
-        if text_output_router_logits and outputs.router_logits is not None:
+        if outputs.router_logits is not None and text_router_aux_loss_coef > 0:
             text_aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
@@ -1858,29 +2020,131 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
                 attention_mask,
             )
             aux_loss = text_aux_loss if aux_loss is None else aux_loss + text_aux_loss
-            weighted_aux_loss = self.config.text_config.router_aux_loss_coef * text_aux_loss
+            weighted_aux_loss = text_router_aux_loss_coef * text_aux_loss
 
-        if vision_output_router_logits and outputs.vision_router_logits is not None:
+        if outputs.vision_router_logits is not None and vision_router_aux_loss_coef > 0:
             vision_aux_loss = load_balancing_loss_func(
                 outputs.vision_router_logits,
                 self.config.vision_config.num_experts,
                 self.config.vision_config.num_experts_per_tok,
             )
             aux_loss = vision_aux_loss if aux_loss is None else aux_loss + vision_aux_loss
-            vision_weighted_aux_loss = self.config.vision_config.router_aux_loss_coef * vision_aux_loss
+            vision_weighted_aux_loss = vision_router_aux_loss_coef * vision_aux_loss
             weighted_aux_loss = (
                 vision_weighted_aux_loss
                 if weighted_aux_loss is None
                 else weighted_aux_loss + vision_weighted_aux_loss
             )
 
+        depth_aux_loss = None
+        weighted_depth_aux_loss = None
+        image_token_mask = None
+        video_token_mask = None
+        vision_token_mask = None
+        all_depth_terms = []
+        if outputs.router_logits is not None and text_router_depth_aux_loss_coef > 0:
+            if input_ids is not None or inputs_embeds is not None:
+                if input_ids is not None:
+                    image_token_mask = input_ids == self.config.image_token_id
+                    video_token_mask = input_ids == self.config.video_token_id
+                else:
+                    image_token_mask, video_token_mask = self.model.get_placeholder_mask(input_ids, inputs_embeds)
+                    image_token_mask = image_token_mask.any(dim=-1)
+                    video_token_mask = video_token_mask.any(dim=-1)
+
+                vision_token_mask = image_token_mask | video_token_mask
+                text_only_token_mask = ~vision_token_mask
+
+                all_depth_terms.extend(collect_depth_routing_kl_terms(
+                    outputs.router_logits,
+                    token_mask=text_only_token_mask,
+                    tensors_are_logits=True,
+                ))
+
+                all_depth_terms.extend(collect_depth_routing_kl_terms(
+                    outputs.router_logits,
+                    token_mask=vision_token_mask,
+                    tensors_are_logits=True,
+                ))
+            else:
+                all_depth_terms.extend(collect_depth_routing_kl_terms(
+                    outputs.router_logits,
+                    tensors_are_logits=True,
+                ))
+
+        if vision_router_depth_aux_loss_coef > 0:
+            all_depth_terms.extend(collect_depth_routing_kl_terms(
+                outputs.image_depth_router_probs,
+                tensors_are_logits=False,
+            ))
+
+            all_depth_terms.extend(collect_depth_routing_kl_terms(
+                outputs.video_depth_router_probs,
+                tensors_are_logits=False,
+            ))
+
+        if (
+            outputs.router_logits is not None
+            and vision_token_mask is not None
+            and text_router_depth_aux_loss_coef > 0
+            and vision_router_depth_aux_loss_coef > 0
+            and (outputs.image_depth_router_probs is not None or outputs.video_depth_router_probs is not None)
+        ):
+            if self.config.vision_config.num_experts != self.config.text_config.num_experts:
+                raise AssertionError(
+                    "Vision-to-text boundary KL requires the same number of experts in vision and text configs. "
+                    f"Got vision={self.config.vision_config.num_experts}, text={self.config.text_config.num_experts}."
+                )
+
+            text_first_router_logits = outputs.router_logits[0]
+
+            image_boundary_depth_loss = boundary_routing_consistency_loss(
+                outputs.image_depth_router_probs,
+                text_first_router_logits,
+                image_token_mask,
+            )
+            if image_boundary_depth_loss is not None:
+                all_depth_terms.append(image_boundary_depth_loss)
+
+            video_boundary_depth_loss = boundary_routing_consistency_loss(
+                outputs.video_depth_router_probs,
+                text_first_router_logits,
+                video_token_mask,
+            )
+            if video_boundary_depth_loss is not None:
+                all_depth_terms.append(video_boundary_depth_loss)
+
+        if all_depth_terms:
+            depth_aux_loss = torch.stack(all_depth_terms).mean()
+            router_depth_aux_loss_coef = getattr(self.config, "router_depth_aux_loss_coef", None) or (
+                0.5 * (text_router_depth_aux_loss_coef + vision_router_depth_aux_loss_coef)
+            )
+            weighted_depth_aux_loss = router_depth_aux_loss_coef * depth_aux_loss
+
+        # TODO: config option for token routing consistency
+        # Aux loss for routing consistency
+        # for any given layer, per token can be done pairwise across the router logit matrix for that layer
+        # for layer i
+
+        # TODO: config option for vision/text routing consistency
+        # text router logits: batch * sequence_length, n_experts
+        # vision router logits batch * num_vision_tokens, n_experts
+        # aggregate text and vision router logits into shape: batch, n_experts
+        # do so along the sequence_length/num_vision_tokens dimensions
+        # Per item in batch, compute KL divergence between text and vision aggregate n_experts weights
+        # Aggregate aux loss across vision/text components along batch dimension
+
         if labels is not None and weighted_aux_loss is not None:
             loss = loss + weighted_aux_loss.to(loss.device)
+
+        if labels is not None and weighted_depth_aux_loss is not None:
+            loss = loss + weighted_depth_aux_loss.to(loss.device)
 
 
         return Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
+            depth_aux_loss=depth_aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

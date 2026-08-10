@@ -12,7 +12,7 @@ import wandb
 import json
 
 from dataclasses import dataclass, field
-from datasets import load_dataset, Dataset, concatenate_datasets, Image, Sequence
+from datasets import load_dataset, Dataset, concatenate_datasets, Image, Sequence, Value
 from datetime import datetime
 from dotenv import load_dotenv
 # from peft import LoraConfig, TaskType, get_peft_model
@@ -83,6 +83,26 @@ class SFTArgs:
         metadata={"help": "Only keep rows whose prompt_id contains at least one of these substrings. If None, no filtering is applied."}
     )
     skip_eval: bool = field(default=False, metadata={"help": "Skip all evaluation. Also skips train/val split — all data is used for training. Useful when using DeepSpeed Stage 1/2."})
+    num_experts_per_tok: int = field(
+        default=2,
+        metadata={"help": "Number of experts to activate per token in MoE layers. Setting >1 can improve performance but increases memory usage and may require higher DeepSpeed stages."}
+    )
+    norm_topk_prob: bool = field(
+        default=False,
+        metadata={"help": "If set, normalize the topk probability of the router gate."}
+    )
+    output_router_logits: bool = field(
+        default=False,
+        metadata={"help": "If set, output the router logits."}
+    )
+    router_aux_loss_coef: float = field(
+        default=0.0,
+        metadata={"help": "Auxiliary loss coefficient for the MoE router."}
+    )
+    router_depth_aux_loss_coef: float = field(
+        default=0.0,
+        metadata={"help": "Auxiliary loss coefficient for the MoE router depth."}
+    )
     train_expert_idx: int = field(
         default=None,
         metadata={"help": "If set, freeze all weights except this expert's FFN and router row. "
@@ -100,6 +120,19 @@ class SFTArgs:
     unfreeze_embed: bool = field(
         default=False,
         metadata={"help": "If set, unfreeze embedding layer parameters after expert/router freezing and before LoRA setup."}
+    )
+    unfreeze_non_ffn: bool = field(
+        default=False,
+        metadata={"help": "If set, unfreeze all parameters that do not belong to FFN/MLP layers after expert/router freezing and before LoRA setup."}
+    )
+    freeze_lm_decoder: bool = field(
+        default=False,
+        metadata={"help": "If set, freeze the language-model decoder parameters so they receive no gradient updates. "
+                          "This also freezes lm_head when present."}
+    )
+    freeze_vision_tower: bool = field(
+        default=False,
+        metadata={"help": "If set, freeze the vision tower parameters so they receive no gradient updates."}
     )
 
     # LoRA parameters
@@ -340,7 +373,13 @@ def preprocess_dataset(dataset):
         # except Exception as e:
         #     print(f"Error processing image bytes for item {item['id']}: {e}")
 
-        id = item["id"] if "id" in item else idx
+        if "prompt_id" in item:
+            id = item["prompt_id"]
+        elif "id" in item:
+            id = item["id"]
+        else:
+            id = idx
+
         conversation = item["conversation"]
         assert conversation[-1]["role"] == "assistant"
         # assert len(conversation) <= 3
@@ -382,7 +421,7 @@ def preprocess_dataset(dataset):
 
     #dataset = dataset.map(load_bytes, num_proc=24)
     dataset = dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=12, with_indices=True).filter(lambda x: x["images"] is not None)
-    dataset = dataset.cast_column("images", Sequence(Image()))
+    dataset = dataset.cast_column("images", Sequence(Image())).cast_column("prompt_id", Value("string"))
 
     # widths_kept = [w for row in dataset["image_widths"] for w in row]
     # heights_kept = [h for row in dataset["image_heights"] for h in row]
@@ -674,6 +713,130 @@ def freeze_all_except_router(model):
             print(f"[trainable-router] {name}")
         else:
             param.requires_grad = False
+
+
+def freeze_lm_decoder_parameters(model, freeze_lm_head: bool = True, verbose: bool = True):
+    """
+    Freeze the language-model decoder path so it receives no optimizer updates.
+
+    This is intentionally a post-processing freeze: call it after other freezing/
+    unfreezing logic and after LoRA injection, so it also disables any trainable
+    adapters inserted under the language_model path.
+    """
+    frozen_names = []
+
+    for name, param in model.named_parameters():
+        is_lm_decoder = (
+            name.startswith("language_model.")
+            or name.startswith("model.language_model.")
+            or ".language_model." in name
+        )
+        is_lm_head = freeze_lm_head and (
+            name == "lm_head.weight"
+            or name.startswith("lm_head.")
+            or name.endswith(".lm_head.weight")
+            or ".lm_head." in name
+        )
+
+        if is_lm_decoder or is_lm_head:
+            if param.requires_grad:
+                frozen_names.append(name)
+            param.requires_grad = False
+
+    if verbose:
+        print(
+            f"[freeze_lm_decoder] frozen trainable params/tensors under language_model"
+            f"{' and lm_head' if freeze_lm_head else ''}: {len(frozen_names)}"
+        )
+        for name in frozen_names[:50]:
+            print(f"[frozen-lm-decoder] {name}")
+        if len(frozen_names) > 50:
+            print(f"[frozen-lm-decoder] ... {len(frozen_names) - 50} more")
+
+    return frozen_names
+
+def unfreeze_non_ffn_parameters(model, verbose: bool = True):
+    """
+    Unfreeze all parameters except FFN/MLP weights under decoder layers or
+    vision blocks.
+
+    This is intended as a post-processing step after a selective freeze so that
+    attention, embeddings, norms, patch merger weights, and other non-FFN
+    weights can be trained together while decoder/vision feed-forward blocks
+    remain frozen.
+    """
+    layer_prefixes = (
+        "model.language_model.layers.",
+        "language_model.layers.",
+        "model.layers.",
+        "layers.",
+        "model.visual.blocks.",
+        "visual.blocks.",
+        "blocks.",
+    )
+    ffn_name_markers = (
+        ".mlp.",
+        ".ffn.",
+        "feed_forward",
+        "feedforward",
+    )
+
+    def is_decoder_or_vision_ffn(name: str) -> bool:
+        return any(name.startswith(prefix) for prefix in layer_prefixes) and any(
+            marker in name for marker in ffn_name_markers
+        )
+
+    unfrozen_names = []
+
+    for name, param in model.named_parameters():
+        if is_decoder_or_vision_ffn(name):
+            continue
+
+        if not param.requires_grad:
+            param.requires_grad = True
+            unfrozen_names.append(name)
+            if verbose:
+                print(f"[trainable-non-ffn] {name}")
+
+    if verbose:
+        print(f"[unfreeze_non_ffn] unfroze params/tensors outside FFN/MLP paths: {len(unfrozen_names)}")
+
+    return unfrozen_names
+
+
+def freeze_vision_tower_parameters(model, verbose: bool = True):
+    """
+    Freeze the vision tower path so it receives no optimizer updates.
+
+    This is intentionally a post-processing freeze: call it after other freezing/
+    unfreezing logic and after LoRA injection, so it also disables any trainable
+    adapters inserted under the vision tower path.
+    """
+    frozen_names = []
+
+    for name, param in model.named_parameters():
+        is_vision_tower = (
+            name.startswith("visual.")
+            or name.startswith("model.visual.")
+            or ".visual." in name
+        )
+
+        if is_vision_tower:
+            if param.requires_grad:
+                frozen_names.append(name)
+            param.requires_grad = False
+
+    if verbose:
+        print(
+            "[freeze_vision_tower] frozen trainable params/tensors under visual: "
+            f"{len(frozen_names)}"
+        )
+        for name in frozen_names[:50]:
+            print(f"[frozen-vision-tower] {name}")
+        if len(frozen_names) > 50:
+            print(f"[frozen-vision-tower] ... {len(frozen_names) - 50} more")
+
+    return frozen_names
 
 
 # def unfreeze_attention_layers(model):
@@ -1111,10 +1274,23 @@ def main():
     model = AutoModelForImageTextToText.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
-        # attn_implementation="flash_attention_2",
-        attn_implementation={"": "sdpa"},
+        attn_implementation="flash_attention_2",
+        # attn_implementation={"": "sdpa"},
         device_map=None,  # device_map conflicts with DeepSpeed, use auto if single gpu
     )
+
+    # Set num_experts_per_tok to activate for training
+    model.config.text_config.num_experts_per_tok = sft_args.num_experts_per_tok
+    model.config.text_config.norm_topk_prob = sft_args.norm_topk_prob
+    model.config.text_config.output_router_logits = sft_args.output_router_logits
+    model.config.text_config.router_aux_loss_coef = sft_args.router_aux_loss_coef
+    model.config.text_config.router_depth_aux_loss_coef = sft_args.router_depth_aux_loss_coef
+
+    model.config.vision_config.num_experts_per_tok = sft_args.num_experts_per_tok
+    model.config.vision_config.norm_topk_prob = sft_args.norm_topk_prob
+    model.config.vision_config.output_router_logits = sft_args.output_router_logits
+    model.config.vision_config.router_aux_loss_coef = sft_args.router_aux_loss_coef
+    model.config.vision_config.router_depth_aux_loss_coef = sft_args.router_depth_aux_loss_coef
 
     print("Loaded model class:", type(model))
     print("Config class:", type(model.config))
@@ -1159,6 +1335,12 @@ def main():
         print("unfreeze_embed=True: unfreezing embedding layers.")
         unfreeze_embedding_layers(model)
 
+    if sft_args.unfreeze_non_ffn:
+        print("unfreeze_non_ffn=True: unfreezing all non-FFN/non-MLP parameters.")
+        unfreeze_non_ffn_parameters(model)
+        print("After unfreeze_non_ffn:")
+        print_trainable_parameters(model)
+
     # ------------------------------------------------------------------
     # LoRA setup
     # ------------------------------------------------------------------
@@ -1198,6 +1380,18 @@ def main():
         }
     elif sft_args.train_expert_idx is not None:
         # Full fine-tune of expert only — just print the parameter count
+        print_trainable_parameters(model)
+
+    if sft_args.freeze_lm_decoder:
+        print("freeze_lm_decoder=True: freezing language-model decoder parameters.")
+        freeze_lm_decoder_parameters(model, freeze_lm_head=True)
+        print("After freeze_lm_decoder:")
+        print_trainable_parameters(model)
+
+    if sft_args.freeze_vision_tower:
+        print("freeze_vision_tower=True: freezing vision tower parameters.")
+        freeze_vision_tower_parameters(model)
+        print("After freeze_vision_tower:")
         print_trainable_parameters(model)
 
     # ------------------------------------------------------------------
@@ -1271,7 +1465,7 @@ def main():
     # VLM-specific safety
     sft_config.remove_unused_columns = False
     sft_config.max_length = None
-    if sft_args.train_expert_idx is not None:
+    if sft_config.gradient_checkpointing:
         sft_config.gradient_checkpointing_kwargs = {"use_reentrant": False}
 
     if sft_args.skip_eval:
@@ -1300,6 +1494,9 @@ def main():
         # "router_tuning_only": sft_args.router_tuning_only,
         # "unfreeze_attn": sft_args.unfreeze_attn,
         # "unfreeze_embed": sft_args.unfreeze_embed,
+        "unfreeze_non_ffn": sft_args.unfreeze_non_ffn,
+        "freeze_lm_decoder": sft_args.freeze_lm_decoder,
+        "freeze_vision_tower": sft_args.freeze_vision_tower,
         **lora_stats,
     }
 
