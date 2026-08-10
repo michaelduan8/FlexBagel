@@ -45,7 +45,7 @@ class Config:
     seed: int = 2026
 
     # Filtering: at least one must be set; if both are set, the stricter wins
-    max_vlm_length: Optional[int] = 2048
+    max_vlm_length: Optional[int] = 2048 #4096
     max_vlm_length_percentile: Optional[float] = None
 
     # Minimum image dimensions — examples with any image smaller than this are
@@ -644,6 +644,7 @@ def main(cfg: Config) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Filter a multimodal dataset by VLM token length.")
     parser.add_argument("--dataset_name", help="Dataset name or path prefix (without .jsonl extension)")
+    parser.add_argument("--max_vlm_length", type=int, help="Maximum VLM sequence length")
     args = parser.parse_args()
 
-    main(Config(dataset_name=args.dataset_name))
+    main(Config(dataset_name=args.dataset_name, max_vlm_length=args.max_vlm_length))

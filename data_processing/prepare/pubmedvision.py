@@ -108,7 +108,7 @@ def main() -> None:
     mapped_dataset.to_json(str(output), orient="records", lines=True)
 
     print(
-        f"Converted {len(mapped_dataset)} rows from {input} "
+        f"Converted {len(mapped_dataset)} rows from {input1} and {input2} "
         f"to {output} (raw_data_dir={raw_data_dir})."
     )
 
