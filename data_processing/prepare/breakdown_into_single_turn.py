@@ -1,4 +1,14 @@
 import json
+import argparse
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Breakdown a conversation into single turns."
+    )
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--output", type=str, default=None)
+    return parser.parse_args()
+
 
 def explode_conversation(row, i):
     conversation = row["conversation"]
@@ -13,7 +23,7 @@ def explode_conversation(row, i):
             continue
 
         new_row = dict(row)
-        new_row["id"] = f"quilt_{i}#assistant_{idx}"
+        new_row["id"] = f"{row['id'] if 'id' in row else ''}_#{i}#assistant_{idx}"
         new_row["conversation"] = conversation[: idx + 1]
 
         new_rows.append(new_row)
@@ -21,8 +31,9 @@ def explode_conversation(row, i):
     return new_rows
 
 
-input_ = "/mnt/quilt/quilt_instruct_w_length_w_path.jsonl"
-output_ = "/mnt/quilt/quilt_instruct_w_length_w_path_flatten.jsonl"
+args = parse_args()
+input_ = args.input
+output_ = args.output if args.output is not None else input_.replace(".jsonl", "_flatten.jsonl")
 
 n_in = 0
 n_out = 0

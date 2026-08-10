@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset",
-        required=True,
+        default="rajpurkarlab/ReXGradient-160K",
         help="Hugging Face dataset path, e.g. org/dataset_name.",
     )
     parser.add_argument(
@@ -47,10 +47,18 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
 
     images = glob.glob(os.path.join(raw_data_dir, subject_id, accession_number, 'studies', study_id, 'series', '*', 'instances', '*'))
     images = list(images)
-    assert len(images) > 0, f"No images found for row with id {id} in raw data directory {raw_data_dir}."
 
-    row["orig_images"] = [row["image"]]
+    # Minimal change: mark missing-image rows, then filter after map()
+    if len(images) == 0:
+        # row["orig_images"] = [row["image"]]
+        row["images"] = []
+        row["conversation"] = []
+        row["missing_images"] = True
+        return row
+
+    # row["orig_images"] = [row["image"]]
     row["images"] = images
+    row["missing_images"] = False
 
     patient_data = f"Sex: {row['PatientSex']}\n\nAge: {row['PatientAge']}\n\nDescription: {row['StudyDescription']}\n\nIndication: {row['Indication']}"
     report = f"Findings: {row['Findings']}\n\nImpression: {row['Impression']}"
@@ -81,12 +89,22 @@ def main() -> None:
         num_proc=12
     )
 
+    missing_count = sum(mapped_dataset["missing_images"])
+
+    mapped_dataset = mapped_dataset.filter(
+        lambda row: not row["missing_images"],
+        num_proc=12,
+    )
+
+    mapped_dataset = mapped_dataset.remove_columns(["missing_images"])
+
     output.parent.mkdir(parents=True, exist_ok=True)
     mapped_dataset.to_json(str(output), orient="records", lines=True)
 
     print(
         f"Converted {len(mapped_dataset)} rows from dataset {dataset_path}:{split} "
-        f"to {output} (raw_data_dir={raw_data_dir})."
+        f"to {output} (raw_data_dir={raw_data_dir}). "
+        f"Skipped {missing_count} rows with missing images."
     )
 
 
