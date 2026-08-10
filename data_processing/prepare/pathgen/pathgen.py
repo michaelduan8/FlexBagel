@@ -65,7 +65,7 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
                 raise ValueError(f"Unexpected image tag location in conversation content: {content}")
 
             content = content.replace("<image>", "").strip()
-        
+
         parsed_turn = {
             "role": role,
             "content": content,
@@ -73,7 +73,7 @@ def map_row(row, raw_data_dir: Path) -> dict[str, Any]:
         }
 
         parsed.append(parsed_turn)
-    
+
     assert counter == 1, f"Expected exactly one image tag in conversation content, but found {counter} in row with id {id}."
 
     row["conversation"] = parsed

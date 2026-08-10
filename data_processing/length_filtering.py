@@ -628,15 +628,15 @@ def main(cfg: Config) -> None:
     print_length_stats(kept["vlm_length"], "Kept", cfg.bad_length)
     print_length_stats(removed_long["vlm_length"], "Removed (too long)", cfg.bad_length)
 
-    if not cfg.keep_length_columns:
-        kept = drop_length_columns(kept, LENGTH_COLUMNS)
-        removed_long = drop_length_columns(removed_long, LENGTH_COLUMNS)
+    # if not cfg.keep_length_columns:
+    #     kept = drop_length_columns(kept, LENGTH_COLUMNS)
+    #     removed_long = drop_length_columns(removed_long, LENGTH_COLUMNS)
 
-    print(f"Saving kept examples → {cfg.output_dataset}")
-    save_dataset(kept, cfg.output_dataset)
+    # print(f"Saving kept examples → {cfg.output_dataset}")
+    # save_dataset(kept, cfg.output_dataset)
 
-    print(f"Saving length-filtered examples → {cfg.removed_dataset}")
-    save_dataset(removed_long, cfg.removed_dataset)
+    # print(f"Saving length-filtered examples → {cfg.removed_dataset}")
+    # save_dataset(removed_long, cfg.removed_dataset)
 
     print("Done.")
 
