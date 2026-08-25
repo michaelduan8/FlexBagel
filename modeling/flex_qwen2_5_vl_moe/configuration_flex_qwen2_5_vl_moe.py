@@ -223,6 +223,8 @@ class Flex_Qwen2_5_VLMoeConfig(PretrainedConfig):
         vision_config=None,
         image_token_id=151655,
         video_token_id=151656,
+        vision_start_token_id=151652,
+        vision_end_token_id=151653,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -238,8 +240,9 @@ class Flex_Qwen2_5_VLMoeConfig(PretrainedConfig):
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.vision_end_token_id = vision_end_token_id
 
-        super().__init__(**kwargs)
-
+        super().__init__(**kwargs)        
 
 __all__ = ["Flex_Qwen2_5_VLMoeConfig", "Flex_Qwen2_5_VLMoeTextConfig", "Flex_Qwen2_5_VLMoeVisionConfig"]

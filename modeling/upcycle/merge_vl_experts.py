@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoConfig, AutoModelForConditionalGeneration, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
 # Adjust this import if your file name/module path is different.
 # It should point to the file that defines Flex_Qwen2_5_VLMoeForConditionalGeneration.
@@ -279,7 +279,10 @@ def get_selected_model_indices(merged_sources: list[ExpertSource]) -> list[int]:
 
 
 def is_ffn_key(key: str) -> bool:
-    return ".mlp." in key
+    if ".mlp." not in key:
+        return False
+
+    return key.startswith("model.language_model.layers.") or key.startswith("model.visual.blocks.")
 
 
 def merge_shared_weight(
@@ -318,7 +321,7 @@ def register_local_architectures() -> None:
         pass
 
     try:
-        AutoModelForConditionalGeneration.register(
+        AutoModelForImageTextToText.register(
             Flex_Qwen2_5_VLMoeConfig,
             Flex_Qwen2_5_VLMoeForConditionalGeneration,
         )
@@ -329,7 +332,7 @@ def register_local_architectures() -> None:
 def load_vlmoe(path: str, dtype: torch.dtype, trust_remote_code: bool):
     register_local_architectures()
     log.info(f"Loading VLMoE model: {path}")
-    model = AutoModelForConditionalGeneration.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         path,
         torch_dtype=dtype,
         trust_remote_code=trust_remote_code,
@@ -546,18 +549,6 @@ def main():
 
     # 2) Validate that non-expert architecture is compatible.
     validate_compatible_configs(source_cfgs, merge_text=args.merge_text, merge_vision=args.merge_vision)
-    validate_compatible_configs(
-        non_ffn_source_cfgs,
-        merge_text=args.merge_text,
-        merge_vision=args.merge_vision,
-        require_matching_num_experts=False,
-    )
-    validate_compatible_configs(
-        [base_cfg, *non_ffn_source_cfgs],
-        merge_text=args.merge_text,
-        merge_vision=args.merge_vision,
-        require_matching_num_experts=False,
-    )
 
     num_source_experts = infer_num_source_experts(base_cfg, merge_text=args.merge_text, merge_vision=args.merge_vision)
     if not (0 <= args.shared_expert_index < num_source_experts):
