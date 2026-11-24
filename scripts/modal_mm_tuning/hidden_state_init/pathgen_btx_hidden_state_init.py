@@ -12,8 +12,8 @@ NUM_GPUS = 4
 
 COMMAND = f"""
     cd /FlexBagel && PYTHONPATH=. torchrun --master_port=29501 --nproc_per_node={NUM_GPUS} train/mm_tune.py \
-    --run_id "pathgen_btx_qwen2_5-3b-vl-flex-hidden_state_init" \
-    --model micdun/pathgen_btx_hidden_state_init \
+    --run_id "pathgen_btx_qwen2_5-3b-vl-flex-hidden_state_init_v2" \
+    --model micdun/pathgen_btx-style-flex_untrained_v2 \
     --datasets /mnt/pathgen/pathgen_train_single_turn_w_length_memory_w_path.jsonl \
     --train_expert_idx 1 \
     --num_train_epochs 1 \
@@ -29,7 +29,7 @@ COMMAND = f"""
     --gradient_checkpointing True \
     --run_seed 42 \
     --run_output_dir "/output/pathgen/" \
-    --save_n_epochs 0.2 \
+    --save_n_epochs 1 \
     --dataset_num_proc 6 \
     --skip_eval \
     --dataloader_num_workers 8 \
