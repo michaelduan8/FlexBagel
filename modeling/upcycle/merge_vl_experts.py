@@ -13,6 +13,7 @@ from modeling.flex_qwen2_5_vl_moe import (
     Flex_Qwen2_5_VLMoeConfig,
     Flex_Qwen2_5_VLMoeForConditionalGeneration,
 )
+from modeling.flex_qwen2_5_vl_moe.configuration_flex_qwen2_5_vl_moe import validate_gate_row_to_expert
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class ExpertSource:
 @dataclass(frozen=True)
 class SparseKeyInfo:
     component: str  # "text" or "vision"
-    kind: str       # "router" or "expert"
+    kind: str       # "router", "expert", or "shared_expert"
     layer_idx: int
     merged_expert_idx: int | None = None
 
@@ -81,6 +82,29 @@ def parse_args():
             "Length must equal number of models. Each item is comma-separated indices, e.g. "
             "'1' '1' for two 2-expert models. If omitted, defaults to all experts except "
             "--shared-expert-index."
+        ),
+    )
+    parser.add_argument(
+        "--as-shared-expert",
+        action="store_true",
+        help=(
+            "Make the --shared-expert-index expert (from --shared-from-model) an always-on shared expert "
+            "(mlp.shared_expert.*) instead of routed expert 0. Remaining selected experts become routed "
+            "experts mlp.experts.0..R-1, and gate row 0 keeps the shared expert's logit so it is weighted by "
+            "its softmax prob over all R+1 logits. Sets use_shared_expert=True and num_experts=R in the target config."
+        ),
+    )
+    parser.add_argument(
+        "--many-to-one-public",
+        action="store_true",
+        help=(
+            "Keep every source model's router row for the shared (--shared-expert-index) expert instead of only "
+            "--shared-from-model's: all of them route to merged expert 0 (the shared expert's FFN, which must be "
+            "bit-identical across sources), and each model's other rows route to its own merged experts. Gate rows "
+            "are ordered per model [shared_1, experts_1..., shared_2, experts_2..., ...] and the mapping is written "
+            "to config.{text,vision}_config.gate_row_to_expert (see modeling/flex_qwen2_5_vl_moe/GATE_ROW_TO_EXPERT.md). "
+            "With --merge-non-ffn-weights, non-FFN tensors are averaged over the source models, once each. "
+            "Not compatible with --as-shared-expert."
         ),
     )
     parser.add_argument(
@@ -181,6 +205,8 @@ def get_sparse_key_info(
         if is_text_sparse_layer(layer_idx, config):
             if ".mlp.gate.weight" in key:
                 return SparseKeyInfo(component="text", kind="router", layer_idx=layer_idx)
+            if ".mlp.shared_expert." in key:
+                return SparseKeyInfo(component="text", kind="shared_expert", layer_idx=layer_idx)
             if ".mlp.experts." in key:
                 suffix = key.split(".mlp.experts.", 1)[1]
                 merged_expert_idx = int(suffix.split(".", 1)[0])
@@ -198,6 +224,8 @@ def get_sparse_key_info(
         if is_vision_sparse_block(block_idx, config):
             if ".mlp.gate.weight" in key:
                 return SparseKeyInfo(component="vision", kind="router", layer_idx=block_idx)
+            if ".mlp.shared_expert." in key:
+                return SparseKeyInfo(component="vision", kind="shared_expert", layer_idx=block_idx)
             if ".mlp.experts." in key:
                 suffix = key.split(".mlp.experts.", 1)[1]
                 merged_expert_idx = int(suffix.split(".", 1)[0])
@@ -276,6 +304,43 @@ def _assert_or_warn_equal(
 
 def get_selected_model_indices(merged_sources: list[ExpertSource]) -> list[int]:
     return [src.model_idx for src in merged_sources]
+
+
+def build_many_to_one_gate_rows(
+    merged_sources: list[ExpertSource],
+    num_models: int,
+    shared_expert_idx: int,
+) -> tuple[list[ExpertSource], list[int]]:
+    """Gate rows [shared_m, experts_m...] per model m; shared rows route to merged expert 0, others to their own."""
+    row_sources, row_to_expert = [], []
+    for model_idx in range(num_models):
+        row_sources.append(ExpertSource(model_idx=model_idx, expert_idx=shared_expert_idx))
+        row_to_expert.append(0)
+        for merged_idx, src in enumerate(merged_sources[1:], start=1):
+            if src.model_idx == model_idx:
+                row_sources.append(src)
+                row_to_expert.append(merged_idx)
+    return row_sources, row_to_expert
+
+
+def check_shared_expert_identical(
+    source_sds: list[dict[str, torch.Tensor]],
+    shared_expert_idx: int,
+    reference_model_idx: int,
+) -> int:
+    """The shared expert is copied once, so its FFN must be bit-identical across all source models."""
+    marker = f".mlp.experts.{shared_expert_idx}."
+    keys = [k for k in source_sds[reference_model_idx] if marker in k]
+    if not keys:
+        raise KeyError(f"No '{marker}' tensors in source model {reference_model_idx}.")
+    for model_idx, sd in enumerate(source_sds):
+        for key in keys:
+            if key not in sd or not torch.equal(sd[key], source_sds[reference_model_idx][key]):
+                raise ValueError(
+                    f"--many-to-one-public: shared expert tensor {key!r} differs between model {model_idx} and "
+                    f"model {reference_model_idx}; the shared expert must be identical (frozen) across sources."
+                )
+    return len(keys)
 
 
 def is_ffn_key(key: str) -> bool:
@@ -454,15 +519,23 @@ def set_target_num_experts(
     merged_num_experts: int,
     merge_text: bool,
     merge_vision: bool,
+    use_shared_expert: bool = False,
 ):
+    # merged_num_experts counts routed experts only when use_shared_expert is set.
     if merge_text and int(cfg.text_config.num_experts) > 0:
         cfg.text_config.num_experts = merged_num_experts
+        if use_shared_expert:
+            cfg.text_config.use_shared_expert = True
+            cfg.text_config.shared_expert_intermediate_size = cfg.text_config.intermediate_size
         if int(cfg.text_config.num_experts_per_tok) > merged_num_experts:
             raise ValueError(
                 f"text_config.num_experts_per_tok={cfg.text_config.num_experts_per_tok} exceeds merged_num_experts={merged_num_experts}."
             )
     if merge_vision and int(cfg.vision_config.num_experts) > 0:
         cfg.vision_config.num_experts = merged_num_experts
+        if use_shared_expert:
+            cfg.vision_config.use_shared_expert = True
+            cfg.vision_config.shared_expert_intermediate_size = cfg.vision_config.intermediate_size
         if int(cfg.vision_config.num_experts_per_tok) > merged_num_experts:
             raise ValueError(
                 f"vision_config.num_experts_per_tok={cfg.vision_config.num_experts_per_tok} exceeds merged_num_experts={merged_num_experts}."
@@ -514,6 +587,24 @@ def copy_expert_weight(
     return src_tensor.clone().to(dtype=target_tensor.dtype)
 
 
+def copy_shared_expert_weight(
+    key: str,
+    target_tensor: torch.Tensor,
+    source_sds: list[dict[str, torch.Tensor]],
+    shared_source: ExpertSource,
+) -> torch.Tensor:
+    src_key = key.replace(".mlp.shared_expert.", f".mlp.experts.{shared_source.expert_idx}.")
+    src_tensor = source_sds[shared_source.model_idx].get(src_key)
+    if src_tensor is None:
+        raise KeyError(f"Missing source tensor for {key!r} from model {shared_source.model_idx}, key {src_key!r}")
+    if src_tensor.shape != target_tensor.shape:
+        raise ValueError(
+            f"Shared expert tensor shape mismatch for {key}: source {src_key} has {tuple(src_tensor.shape)}, "
+            f"target has {tuple(target_tensor.shape)}"
+        )
+    return src_tensor.clone().to(dtype=target_tensor.dtype)
+
+
 def main():
     args = parse_args()
     if len(args.models) < 1:
@@ -549,6 +640,9 @@ def main():
 
     # 2) Validate that non-expert architecture is compatible.
     validate_compatible_configs(source_cfgs, merge_text=args.merge_text, merge_vision=args.merge_vision)
+    for model_idx, cfg in enumerate(source_cfgs):
+        if getattr(cfg.text_config, "use_shared_expert", False) or getattr(cfg.vision_config, "use_shared_expert", False):
+            raise ValueError(f"Source model {model_idx} already uses use_shared_expert=True; merging such checkpoints is not supported.")
 
     num_source_experts = infer_num_source_experts(base_cfg, merge_text=args.merge_text, merge_vision=args.merge_vision)
     if not (0 <= args.shared_expert_index < num_source_experts):
@@ -572,14 +666,36 @@ def main():
         for expert_idx in expert_ids:
             merged_sources.append(ExpertSource(model_idx=model_idx, expert_idx=expert_idx))
 
-    merged_num_experts = len(merged_sources)
+    # With --as-shared-expert, merged_sources[0] becomes mlp.shared_expert and the rest are routed
+    # experts mlp.experts.0..R-1. Gate rows still follow merged_sources (row 0 = shared logit).
+    routed_sources = merged_sources[1:] if args.as_shared_expert else merged_sources
+    merged_num_experts = len(routed_sources)
     if merged_num_experts < 1:
-        raise ValueError("Merged model must have at least one expert.")
+        raise ValueError("Merged model must have at least one routed expert.")
 
     selected_model_indices = get_selected_model_indices(merged_sources)
 
+    gate_row_sources = merged_sources
+    gate_row_to_expert = None
+    if args.many_to_one_public:
+        if args.as_shared_expert:
+            raise ValueError("--many-to-one-public cannot be combined with --as-shared-expert.")
+        n_checked = check_shared_expert_identical(source_sds, args.shared_expert_index, args.shared_from_model)
+        log.info("Shared expert %d is identical across all %d source models (%d tensors checked).",
+                 args.shared_expert_index, len(source_sds), n_checked)
+        gate_row_sources, gate_row_to_expert = build_many_to_one_gate_rows(
+            merged_sources, len(args.models), args.shared_expert_index
+        )
+        # every source model contributes a router row, so average non-FFN tensors over models once each
+        selected_model_indices = list(range(len(args.models)))
+        log.info("Many-to-one gate rows (row -> src_model:src_expert -> merged expert):")
+        for row, (src, expert) in enumerate(zip(gate_row_sources, gate_row_to_expert)):
+            log.info(f"  {row} -> {src.model_idx}:{src.expert_idx} -> {expert}")
+
     log.info("Merged expert mapping (merged_idx -> src_model:src_expert):")
-    for merged_idx, src in enumerate(merged_sources):
+    if args.as_shared_expert:
+        log.info(f"  shared -> {merged_sources[0].model_idx}:{merged_sources[0].expert_idx}")
+    for merged_idx, src in enumerate(routed_sources):
         log.info(f"  {merged_idx} -> {src.model_idx}:{src.expert_idx}")
     if args.merge_non_ffn_weights:
         if args.non_ffn_seeds is None:
@@ -600,7 +716,14 @@ def main():
         merged_num_experts=merged_num_experts,
         merge_text=args.merge_text,
         merge_vision=args.merge_vision,
+        use_shared_expert=args.as_shared_expert,
     )
+    if gate_row_to_expert is not None:
+        for component, enabled in (("text_config", args.merge_text), ("vision_config", args.merge_vision)):
+            sub_cfg = getattr(target_cfg, component)
+            if enabled and int(sub_cfg.num_experts) > 0:
+                sub_cfg.gate_row_to_expert = list(gate_row_to_expert)
+                validate_gate_row_to_expert(sub_cfg)
 
     log.info(
         "Instantiating target model with text_num_experts=%s, vision_num_experts=%s",
@@ -626,7 +749,7 @@ def main():
         )
 
         if sparse_info is not None and sparse_info.kind == "router":
-            target_sd[key] = copy_router_weight(key, target_sd[key], source_sds, merged_sources)
+            target_sd[key] = copy_router_weight(key, target_sd[key], source_sds, gate_row_sources)
             copied_router += 1
             continue
 
@@ -636,9 +759,14 @@ def main():
                 key,
                 target_sd[key],
                 source_sds,
-                merged_sources,
+                routed_sources,
                 sparse_info.merged_expert_idx,
             )
+            copied_expert += 1
+            continue
+
+        if sparse_info is not None and sparse_info.kind == "shared_expert":
+            target_sd[key] = copy_shared_expert_weight(key, target_sd[key], source_sds, merged_sources[0])
             copied_expert += 1
             continue
 

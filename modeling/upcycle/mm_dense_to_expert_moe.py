@@ -47,6 +47,10 @@ def parse_args():
                         help="Enable returning router logits during forward pass.")
     parser.add_argument("--merge-non-moe-weights", action="store_true",
                         help="Average all non-MoE/shared weights across input models instead of taking model 0.")
+    parser.add_argument("--non-moe-seed", type=int, default=None,
+                        help="Model index to source shared/non-MoE weights from. "
+                            "If omitted, all shared weights must match exactly unless "
+                            "--merge-non-moe-weights is specified.")
     parser.add_argument("--shared-expert-init", choices=["mean", "first"], default="mean")
     parser.add_argument("--processor", type=str, default=None,
                         help="Path/HF hub ID to load the processor from. "
@@ -355,21 +359,35 @@ def load_dense_model(path: str, dtype=torch.bfloat16):
     return sd, config
 
 
-def _get_shared_weight(key: str, state_dicts: list[dict[str, torch.Tensor]], merge_weights: bool) -> torch.Tensor | None:
-    tensors = [sd[key] for sd in state_dicts if key in sd]
+def _get_shared_weight(
+    key: str,
+    state_dicts: list[dict[str, torch.Tensor]],
+    merge_weights: bool,
+    non_moe_seed: int | None,
+) -> torch.Tensor | None:
+    if non_moe_seed is not None:
+        if key not in state_dicts[non_moe_seed]:
+            raise KeyError(
+                f"Shared key '{key}' is missing from the selected --non-moe-seed model {non_moe_seed}."
+            )
+        return state_dicts[non_moe_seed][key].clone()
+
+    tensors = []
+    missing_models = []
+    for model_idx, sd in enumerate(state_dicts):
+        if key not in sd:
+            missing_models.append(model_idx)
+            continue
+        tensors.append(sd[key])
+
     if not tensors:
         return None
 
-    if not merge_weights:
-        ref = tensors[0]
-        for i, tensor in enumerate(tensors[1:], 1):
-            if not torch.equal(ref, tensor):
-                log.warning(
-                    f"Shared key '{key}' differs between expert 0 and expert {i}. "
-                    "Using expert 0's value."
-                )
-                break
-        return ref.clone()
+    if missing_models:
+        raise KeyError(
+            f"Shared key '{key}' is missing from models {missing_models}. "
+            "Provide --non-moe-seed to select a source model or ensure shared components match across all models."
+        )
 
     ref_shape = tensors[0].shape
     ref_dtype = tensors[0].dtype
@@ -379,6 +397,16 @@ def _get_shared_weight(key: str, state_dicts: list[dict[str, torch.Tensor]], mer
                 f"Cannot average shared key '{key}': model 0 has shape {ref_shape}, "
                 f"but model {i} has shape {tensor.shape}."
             )
+
+    if not merge_weights:
+        ref = tensors[0]
+        for i, tensor in enumerate(tensors[1:], 1):
+            if not torch.equal(ref, tensor):
+                raise AssertionError(
+                    f"Shared key '{key}' differs between model 0 and model {i}. "
+                    "Provide --non-moe-seed to choose a source model or --merge-non-moe-weights to average shared weights."
+                )
+        return ref.clone()
 
     avg = torch.stack([tensor.float() for tensor in tensors], dim=0).mean(dim=0)
     return avg.to(ref_dtype)
@@ -404,6 +432,14 @@ def main():
     if args.embeddings_dict and (args.text_embeddings or args.vision_embeddings):
         raise ValueError(
             "--embeddings-dict is an alternative to --text-embeddings/--vision-embeddings; do not provide both."
+        )
+
+    if args.non_moe_seed is not None and args.merge_non_moe_weights:
+        raise ValueError("--non-moe-seed cannot be combined with --merge-non-moe-weights.")
+
+    if args.non_moe_seed is not None and not 0 <= args.non_moe_seed < num_experts:
+        raise ValueError(
+            f"--non-moe-seed must be in [0, {num_experts - 1}], got {args.non_moe_seed}."
         )
 
     # ------------------------------------------------------------------
@@ -454,7 +490,9 @@ def main():
 
         # Global shared weights
         if not key.startswith("model.visual.blocks.") and not key.startswith("model.language_model.layers."):
-            shared_weight = _get_shared_weight(key, dense_sds, args.merge_non_moe_weights)
+            shared_weight = _get_shared_weight(
+                key, dense_sds, args.merge_non_moe_weights, args.non_moe_seed
+            )
             if shared_weight is not None:
                 moe_sd[key] = shared_weight
             else:
@@ -467,7 +505,9 @@ def main():
 
             # Attention + norms — always shared
             if ".attn." in key or "norm" in key:
-                shared_weight = _get_shared_weight(key, dense_sds, args.merge_non_moe_weights)
+                shared_weight = _get_shared_weight(
+                    key, dense_sds, args.merge_non_moe_weights, args.non_moe_seed
+                )
                 if shared_weight is not None:
                     moe_sd[key] = shared_weight
                 else:
@@ -508,7 +548,9 @@ def main():
 
             # Attention + norms — always shared
             if ".self_attn." in key or "layernorm" in key:
-                shared_weight = _get_shared_weight(key, dense_sds, args.merge_non_moe_weights)
+                shared_weight = _get_shared_weight(
+                    key, dense_sds, args.merge_non_moe_weights, args.non_moe_seed
+                )
                 if shared_weight is not None:
                     moe_sd[key] = shared_weight
                 else:
@@ -517,7 +559,9 @@ def main():
 
             # Dense MLP layers
             if ".mlp." in key and not sparse:
-                shared_weight = _get_shared_weight(key, dense_sds, args.merge_non_moe_weights)
+                shared_weight = _get_shared_weight(
+                    key, dense_sds, args.merge_non_moe_weights, args.non_moe_seed
+                )
                 if shared_weight is not None:
                     moe_sd[key] = shared_weight
                 else:

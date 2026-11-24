@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import pickle
@@ -11,7 +12,7 @@ from typing import Any
 
 import torch
 
-from datasets import load_dataset
+from datasets import Dataset, Features, Sequence, Value
 from PIL import Image as PILImage
 from PIL import ImageFile
 from tqdm import tqdm
@@ -25,6 +26,7 @@ from modeling.routing_embeddings.hidden_state_monitor import FfnHiddenStateMonit
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+DEFAULT_VIDEO_FPS = 2.0  # mm_tune.py's --default_video_fps, for video rows without video_fps
 
 _ORIG_GETEXIF = PILImage.Image.getexif
 
@@ -57,17 +59,21 @@ def register_local_architectures() -> None:
 
 
 def preprocess_dataset(dataset):
-	"""Borrow the prompt/image shaping from mm_tune.py for inference-time use."""
+	"""Borrow the prompt/image shaping from mm_tune.py for inference-time use.
+
+	Rows may also carry `videos` (one frame-path list per video) and `video_fps`, as in the video
+	training data; video placeholders follow the image placeholders, as in mm_tune.py.
+	"""
 
 	def convert_row(item, idx):
-		image_key = "images"
-		assert image_key in item and "conversation" in item
+		assert ("images" in item or "videos" in item) and "conversation" in item
 
 		prompt_id = item["id"] if "id" in item else idx
 		conversation = item["conversation"]
 		assert conversation[-1]["role"] == "assistant"
 
-		images = item[image_key]
+		images = item.get("images") or []
+		videos = item.get("videos") or []
 		prompt = []
 		used_image = False
 
@@ -76,10 +82,10 @@ def preprocess_dataset(dataset):
 			if (
 				turn["role"] == "user"
 				and turn.get("img_loc") is not None
-				and images
+				and (images or videos)
 				and not used_image
 			):
-				image_content = [{"type": "image"} for _ in images]
+				image_content = [{"type": "image"} for _ in images] + [{"type": "video"} for _ in videos]
 				if turn["img_loc"] == "before":
 					content = image_content + content
 				else:
@@ -89,20 +95,32 @@ def preprocess_dataset(dataset):
 			prompt.append({"role": turn["role"], "content": content})
 
 		return {
-			"prompt_id": prompt_id,
+			"prompt_id": str(prompt_id),
 			"prompt": prompt,
 			"completion": [{
 				"role": "assistant",
 				"content": [{"type": "text", "text": conversation[-1]["content"]}],
 			}],
-			"images": [{"bytes": None, "path": img_path} for img_path in images] if images else [],
+			# plain paths (not {"bytes","path"} records) so image-only and video-only shards share one type
+			"image_paths": list(images),
+			"videos": videos,
+			"video_fps": [float(f) for f in (item.get("video_fps") or [DEFAULT_VIDEO_FPS] * len(videos))],
 		}
 
+	turn = [{"role": Value("string"), "content": [{"type": Value("string"), "text": Value("string")}]}]
+	# explicit output schema: otherwise a shard holding only image rows (or only video rows) infers an empty-list
+	# type for the other modality and the shards can't be concatenated
+	features = Features({
+		"prompt_id": Value("string"), "prompt": turn, "completion": turn,
+		"image_paths": Sequence(Value("string")), "videos": Sequence(Sequence(Value("string"))),
+		"video_fps": Sequence(Value("float32")),
+	})
 	return dataset.map(
 		convert_row,
 		remove_columns=dataset.column_names,
 		num_proc=12,
 		with_indices=True,
+		features=features,
 	)
 
 
@@ -113,14 +131,19 @@ def dataset_to_examples(dataset) -> list[dict[str, Any]]:
 			{
 				"prompt_id": row["prompt_id"],
 				"prompt": row["prompt"],
-				"image_paths": [image["path"] for image in row["images"]] if row["images"] else [],
+				"image_paths": row["image_paths"] or [],
+				"video_paths": row["videos"] or [],
+				"video_fps": row["video_fps"] or [],
 			}
 		)
 	return examples
 
 
 def load_and_sample_examples(dataset_path: str, query_amount: int, seed: int) -> list[dict[str, Any]]:
-	dataset = load_dataset("json", data_files=dataset_path, split="train")
+	# Dataset.from_list infers one schema over all rows; the block-wise JSON loader fails when image-only and
+	# video-only rows are mixed (e.g. `videos` typed as an empty list from an all-image block).
+	with open(dataset_path, encoding="utf-8") as f:
+		dataset = Dataset.from_list([json.loads(line) for line in f if line.strip()])
 	dataset = preprocess_dataset(dataset)
 
 	if len(dataset) == 0:
@@ -171,6 +194,11 @@ def load_model_and_processor(model_name: str, device: torch.device, dtype_name: 
 	return model, processor
 
 
+def _load_rgb(path: str) -> PILImage.Image:
+	with PILImage.open(path) as image:
+		return image.convert("RGB")
+
+
 def load_example_images(example: dict[str, Any]) -> list[PILImage.Image] | None:
 	image_paths = example["image_paths"]
 	if not image_paths:
@@ -190,7 +218,11 @@ def prepare_inputs(example: dict[str, Any], processor, device: torch.device) -> 
 		add_generation_prompt=True,
 	)
 	images = load_example_images(example)
-	inputs = processor(text=text, images=images, return_tensors="pt")
+	videos = [
+		[_load_rgb(path) for path in frame_paths] for frame_paths in example.get("video_paths", [])
+	]
+	video_kwargs = {"videos": videos, "fps": example["video_fps"]} if videos else {}
+	inputs = processor(text=text, images=images, return_tensors="pt", **video_kwargs)
 	return {name: value.to(device) for name, value in inputs.items()}
 
 

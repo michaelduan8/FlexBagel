@@ -2,6 +2,8 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 
+from .modeling_flex_qwen2_5_vl_moe import gate_rows_to_expert_scores
+
 
 class MoeRoutingMonitor:
     """
@@ -188,13 +190,31 @@ class MoeRoutingMonitor:
 
             with torch.inference_mode():
                 router_logits = router_logits.detach()
+                if getattr(moe_block, "use_shared_expert", False):
+                    # Drop the always-on shared expert column; stats are over routed experts.
+                    router_logits = router_logits[..., 1:]
+                elif getattr(moe_block, "always_active_expert", None) is not None:
+                    # Report the routed pick among the non-pinned experts.
+                    router_logits = router_logits.clone()
+                    router_logits[..., moe_block.always_active_expert] = float("-inf")
                 probs = F.softmax(router_logits.float(), dim=-1)
 
                 num_experts = moe_block.num_experts
 
-                # k=1, so this is the actual routed expert. Computed once and
-                # reused (the old code called probs.max(dim=-1) twice).
-                max_prob, selected_expert = probs.max(dim=-1)
+                mapping = getattr(moe_block, "gate_row_to_expert", None)
+                if mapping is not None:
+                    # Many-to-one routing: the routed expert is the one with the best gate row (as in the
+                    # block), and entropy is over each expert's summed row probability.
+                    expert_scores = gate_rows_to_expert_scores(
+                        probs, mapping, num_experts,
+                        "sum" if getattr(moe_block, "gate_row_aggregation", None) == "sum" else "amax",
+                    )
+                    max_prob, selected_expert = expert_scores.max(dim=-1)
+                    probs = gate_rows_to_expert_scores(probs, mapping, num_experts, "sum")
+                else:
+                    # k=1, so this is the actual routed expert. Computed once and
+                    # reused (the old code called probs.max(dim=-1) twice).
+                    max_prob, selected_expert = probs.max(dim=-1)
 
                 num_tokens = selected_expert.numel()
                 expert_path = selected_expert.reshape(batch_size, seq_len)

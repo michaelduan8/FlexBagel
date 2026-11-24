@@ -36,9 +36,61 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
-from .configuration_flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeTextConfig, Flex_Qwen2_5_VLMoeVisionConfig
+from .configuration_flex_qwen2_5_vl_moe import (
+    Flex_Qwen2_5_VLMoeConfig,
+    Flex_Qwen2_5_VLMoeTextConfig,
+    Flex_Qwen2_5_VLMoeVisionConfig,
+    validate_gate_row_to_expert,
+)
 
 logger = logging.get_logger(__name__)
+
+
+def gate_rows_to_expert_scores(
+    row_probs: torch.Tensor,
+    gate_row_to_expert: torch.Tensor,
+    num_experts: int,
+    reduce: str,
+) -> torch.Tensor:
+    """Collapse per-gate-row probabilities [..., num_rows] to per-expert values [..., num_experts].
+
+    reduce="amax": routing score (an expert's best row); reduce="sum": the expert's total probability mass.
+    Every expert owns at least one row (validated in the config), so no output stays at the zero init.
+    """
+    index = gate_row_to_expert.to(row_probs.device).expand_as(row_probs)
+    out = row_probs.new_zeros(*row_probs.shape[:-1], num_experts)
+    return out.scatter_reduce(-1, index, row_probs, reduce=reduce, include_self=False)
+
+
+def gate_rows_to_expert_logits(
+    row_logits: torch.Tensor,
+    gate_row_to_expert: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Per-expert logits whose softmax equals each expert's summed row probability (logsumexp over its rows)."""
+    index = gate_row_to_expert.to(row_logits.device)
+    return torch.stack(
+        [torch.logsumexp(row_logits[..., index == e], dim=-1) for e in range(num_experts)], dim=-1
+    )
+
+
+def select_experts_many_to_one(
+    row_probs: torch.Tensor,
+    gate_row_to_expert: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    aggregation: Optional[str] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k over distinct experts; returns (weights, expert indices).
+
+    Each expert is scored by its best gate row (aggregation None / "max", the default) or by the sum of its
+    rows' probs (aggregation "sum"), and is weighted by that score.
+    """
+    if aggregation not in (None, "max", "sum"):
+        raise ValueError(f"aggregation must be None, 'max' or 'sum', got {aggregation!r}.")
+    reduce = "sum" if aggregation == "sum" else "amax"
+    expert_scores = gate_rows_to_expert_scores(row_probs, gate_row_to_expert, num_experts, reduce)
+    return torch.topk(expert_scores, top_k, dim=-1)
 
 
 def load_balancing_loss_func(
@@ -46,9 +98,14 @@ def load_balancing_loss_func(
     num_experts: Optional[int] = None,
     top_k: int = 2,
     attention_mask: Optional[torch.Tensor] = None,
+    gate_row_to_expert: Optional[list[int]] = None,
+    gate_row_aggregation: Optional[str] = None,
 ) -> Union[torch.Tensor, int]:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer.
+
+    With gate_row_to_expert, gate_logits are per gate row: experts are selected as in the MoE block (top-k over
+    distinct experts by their best row) and an expert's router prob is the sum of its rows' probs.
     """
     if gate_logits is None or not isinstance(gate_logits, tuple) or len(gate_logits) == 0:
         return 0
@@ -57,7 +114,14 @@ def load_balancing_loss_func(
     concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    if gate_row_to_expert is None:
+        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    else:
+        mapping = torch.as_tensor(gate_row_to_expert, device=compute_device)
+        _, selected_experts = select_experts_many_to_one(
+            routing_weights, mapping, num_experts, top_k, aggregation=gate_row_aggregation
+        )
+        routing_weights = gate_rows_to_expert_scores(routing_weights, mapping, num_experts, "sum")
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
 
     if attention_mask is None:
@@ -89,6 +153,24 @@ def load_balancing_loss_func(
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
+
+
+def routed_only_router_logits(
+    router_logits: Union[tuple[torch.Tensor], None],
+    config,
+) -> Union[tuple[torch.Tensor], None]:
+    """Drop the always-on shared expert column (gate row 0) so aux losses see only routed experts.
+
+    With gate_row_to_expert, collapse gate rows to per-expert logits (logsumexp over each expert's rows), so
+    the softmax-based depth/boundary losses and vision pooling compare per-expert summed probabilities.
+    """
+    mapping = getattr(config, "gate_row_to_expert", None)
+    if router_logits is not None and mapping is not None:
+        index = torch.as_tensor(mapping)
+        return tuple(gate_rows_to_expert_logits(layer_logits, index, config.num_experts) for layer_logits in router_logits)
+    if router_logits is None or not getattr(config, "use_shared_expert", False):
+        return router_logits
+    return tuple(layer_logits[:, 1:] for layer_logits in router_logits)
 
 
 def collect_depth_routing_kl_terms(
@@ -229,16 +311,48 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
+        self.use_shared_expert = getattr(config, "use_shared_expert", False)
 
         # gating
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        # With a shared expert, gate row 0 is the shared expert's logit and rows 1..num_experts
+        # map to experts[0..num_experts-1]. The shared expert is always active, weighted by its
+        # softmax prob over all num_experts + 1 logits; top_k is chosen among routed experts only.
+        num_gate_rows = config.num_experts + 1 if self.use_shared_expert else config.num_experts
+        # Many-to-one routing (GATE_ROW_TO_EXPERT.md): gate row r routes to expert gate_row_to_expert[r].
+        # A plain tensor attribute (not a buffer) so meta-device loading never leaves it unmaterialized.
+        validate_gate_row_to_expert(config)
+        mapping = getattr(config, "gate_row_to_expert", None)
+        self.gate_row_to_expert = None if mapping is None else torch.tensor(mapping, dtype=torch.long)
+        self.gate_row_aggregation = getattr(config, "gate_row_aggregation", None)  # None / "max" = best row
+        if mapping is not None:
+            num_gate_rows = len(mapping)
+        self.gate = nn.Linear(config.hidden_size, num_gate_rows, bias=False)
+        # Optional cosine routing: logits = router_temperature * cos(hidden, gate row). Off by default (plain W h).
+        self.router_normalize = bool(getattr(config, "router_normalize", False))
+        self.router_temperature = float(getattr(config, "router_temperature", 1.0))
         self.experts = nn.ModuleList(
             [Flex_Qwen2_5_VLMoeMLP(config, bias=bias) for _ in range(self.num_experts)]
         )
 
-        # TODO: disabling shared expert
-        # self.shared_expert = Flex_Qwen2_5_VLMoeMLP(config, intermediate_size=config.shared_expert_intermediate_size, bias=bias)
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        if self.use_shared_expert:
+            self.shared_expert = Flex_Qwen2_5_VLMoeMLP(
+                config, intermediate_size=config.shared_expert_intermediate_size, bias=bias
+            )
+
+        # Optionally pin one existing routed expert on for every token (no new weights).
+        self.always_active_expert = getattr(config, "always_active_expert", None)
+        if self.always_active_expert is not None:
+            if self.use_shared_expert:
+                raise ValueError("always_active_expert cannot be combined with use_shared_expert.")
+            if not 0 <= self.always_active_expert < self.num_experts:
+                raise ValueError(
+                    f"always_active_expert={self.always_active_expert} out of range for num_experts={self.num_experts}."
+                )
+            if self.top_k > self.num_experts - 1:
+                raise ValueError(
+                    f"num_experts_per_tok={self.top_k} must be <= num_experts - 1 = {self.num_experts - 1} "
+                    "when always_active_expert is set."
+                )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # (batchsize, num_tokens, hidden_size)
         """ """
@@ -259,20 +373,52 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
         # concat i=1->n (batch i x sequence length, hidden dim)
         hidden_states = hidden_states.reshape(-1, hidden_dim)  # changed from view -> reshape
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states) 
+        if self.router_normalize:
+            router_logits = self.router_temperature * F.linear(
+                F.normalize(hidden_states.float(), dim=-1), F.normalize(self.gate.weight.float(), dim=-1)
+            ).to(hidden_states.dtype)
+        else:
+            router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        shared_weight = None
+        if self.use_shared_expert:
+            shared_weight = routing_weights[:, :1]
+            routing_weights = routing_weights[:, 1:]
         if False:
             random_scores = torch.rand_like(routing_weights)
             selected_experts = torch.argsort(random_scores, dim=-1, descending=True)[:, : self.top_k]
             routing_weights = routing_weights.new_full(selected_experts.shape, 1.0 / self.top_k)
+        elif self.gate_row_to_expert is not None:
+            # Softmax over all gate rows; top_k over distinct experts scored by their best row, so an expert
+            # with several rows in the top-k still runs once (weighted by that best row's prob).
+            if self.always_active_expert is not None:
+                raise ValueError("gate_row_to_expert cannot be combined with always_active_expert.")
+            routing_weights, selected_experts = select_experts_many_to_one(
+                routing_weights, self.gate_row_to_expert, self.num_experts, self.top_k,
+                aggregation=self.gate_row_aggregation,
+            )
+        elif self.always_active_expert is not None:
+            # Pinned expert keeps its softmax prob; top_k are chosen among the remaining experts.
+            pinned = self.always_active_expert
+            pinned_weight = routing_weights[:, pinned:pinned + 1]
+            candidates = routing_weights.clone()
+            candidates[:, pinned] = -1.0
+            topk_weights, topk_experts = torch.topk(candidates, self.top_k, dim=-1)
+            routing_weights = torch.cat([pinned_weight, topk_weights], dim=-1)
+            selected_experts = torch.cat([torch.full_like(topk_experts[:, :1], pinned), topk_experts], dim=-1)
         else:
             routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         # if self.top_k == 1:
         #     routing_weights = torch.ones_like(routing_weights)
         # el
         if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            # Normalize over {shared} U top-k so the active weights sum to 1.
+            denom = routing_weights.sum(dim=-1, keepdim=True)
+            if shared_weight is not None:
+                denom = denom + shared_weight
+                shared_weight = shared_weight / denom
+            routing_weights = routing_weights / denom
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -302,11 +448,9 @@ class Flex_Qwen2_5_VLMoeSparseMoeBlock(nn.Module):
             # the `top_x` tensor here.
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
-        # TODO: not in use rn
-        # shared_expert_output = self.shared_expert(hidden_states)
-        # shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-
-        final_hidden_states = final_hidden_states # + shared_expert_output
+        if shared_weight is not None:
+            shared_expert_output = self.shared_expert(hidden_states) * shared_weight.to(hidden_states.dtype)
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
@@ -832,7 +976,7 @@ class Flex_Qwen2_5_VLMoeVisionTransformerPretrainedModel(Flex_Qwen2_5_VLMoePreTr
         depth_router_probs = None
         if return_depth_router_probs:
             depth_router_probs = pool_vision_router_probs_to_merged_tokens(
-                all_router_logits,
+                routed_only_router_logits(all_router_logits, self.config),
                 self.spatial_merge_unit,
                 reverse_indices,
             )
@@ -2005,28 +2149,51 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
+        # Share of the accumulated batch's label tokens in this micro-batch (1 when the Trainer gives no
+        # num_items_in_batch, e.g. plain forward calls): the per-micro-batch router aux losses are scaled by it so
+        # that, like the cross-entropy below, they add up to a token-weighted mean over the accumulated batch.
+        aux_loss_scale = 1.0
         if labels is not None:
             # TODO: might be able to just use self.config.vocab_size rather than text_config.vocab_size, need to confirm
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+            # kwargs carries the Trainer's num_items_in_batch: the loss is then summed over this micro-batch's tokens
+            # and divided by the token count of the whole accumulated (and, by default, cross-device) batch, which is
+            # what the Trainer assumes for a forward that takes **kwargs. Without it the loss was a per-micro-batch
+            # mean that the Trainer neither divided by gradient_accumulation_steps nor left unscaled by num_processes.
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs)
+            num_items_in_batch = kwargs.get("num_items_in_batch")
+            if num_items_in_batch is not None:
+                local_items = (labels[..., 1:] != -100).sum()  # the shifted targets ForCausalLMLoss counts
+                aux_loss_scale = local_items.to(loss.device) / torch.as_tensor(num_items_in_batch, device=loss.device)
 
-        
+
+        # Aux losses only see routed experts; the shared expert column (if any) is dropped.
+        text_router_logits = routed_only_router_logits(outputs.router_logits, self.config.text_config)
+        vision_router_logits = routed_only_router_logits(outputs.vision_router_logits, self.config.vision_config)
+
         aux_loss = None
         weighted_aux_loss = None
-        if outputs.router_logits is not None and text_router_aux_loss_coef > 0:
+        if text_router_logits is not None and text_router_aux_loss_coef > 0:
+            text_mapping = getattr(self.config.text_config, "gate_row_to_expert", None)
             text_aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
+                # many-to-one routing needs the raw gate rows to reproduce the block's expert selection
+                outputs.router_logits if text_mapping is not None else text_router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
                 attention_mask,
+                gate_row_to_expert=text_mapping,
+                gate_row_aggregation=getattr(self.config.text_config, "gate_row_aggregation", None),
             )
             aux_loss = text_aux_loss if aux_loss is None else aux_loss + text_aux_loss
             weighted_aux_loss = text_router_aux_loss_coef * text_aux_loss
 
-        if outputs.vision_router_logits is not None and vision_router_aux_loss_coef > 0:
+        if vision_router_logits is not None and vision_router_aux_loss_coef > 0:
+            vision_mapping = getattr(self.config.vision_config, "gate_row_to_expert", None)
             vision_aux_loss = load_balancing_loss_func(
-                outputs.vision_router_logits,
+                outputs.vision_router_logits if vision_mapping is not None else vision_router_logits,
                 self.config.vision_config.num_experts,
                 self.config.vision_config.num_experts_per_tok,
+                gate_row_to_expert=vision_mapping,
+                gate_row_aggregation=getattr(self.config.vision_config, "gate_row_aggregation", None),
             )
             aux_loss = vision_aux_loss if aux_loss is None else aux_loss + vision_aux_loss
             vision_weighted_aux_loss = vision_router_aux_loss_coef * vision_aux_loss
@@ -2042,7 +2209,7 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         video_token_mask = None
         vision_token_mask = None
         all_depth_terms = []
-        if outputs.router_logits is not None and text_router_depth_aux_loss_coef > 0:
+        if text_router_logits is not None and text_router_depth_aux_loss_coef > 0:
             if input_ids is not None or inputs_embeds is not None:
                 if input_ids is not None:
                     image_token_mask = input_ids == self.config.image_token_id
@@ -2056,19 +2223,19 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
                 text_only_token_mask = ~vision_token_mask
 
                 all_depth_terms.extend(collect_depth_routing_kl_terms(
-                    outputs.router_logits,
+                    text_router_logits,
                     token_mask=text_only_token_mask,
                     tensors_are_logits=True,
                 ))
 
                 all_depth_terms.extend(collect_depth_routing_kl_terms(
-                    outputs.router_logits,
+                    text_router_logits,
                     token_mask=vision_token_mask,
                     tensors_are_logits=True,
                 ))
             else:
                 all_depth_terms.extend(collect_depth_routing_kl_terms(
-                    outputs.router_logits,
+                    text_router_logits,
                     tensors_are_logits=True,
                 ))
 
@@ -2084,7 +2251,7 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
             ))
 
         if (
-            outputs.router_logits is not None
+            text_router_logits is not None
             and vision_token_mask is not None
             and text_router_depth_aux_loss_coef > 0
             and vision_router_depth_aux_loss_coef > 0
@@ -2096,7 +2263,7 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
                     f"Got vision={self.config.vision_config.num_experts}, text={self.config.text_config.num_experts}."
                 )
 
-            text_first_router_logits = outputs.router_logits[0]
+            text_first_router_logits = text_router_logits[0]
 
             image_boundary_depth_loss = boundary_routing_consistency_loss(
                 outputs.image_depth_router_probs,
@@ -2135,10 +2302,10 @@ class Flex_Qwen2_5_VLMoeForConditionalGeneration(Flex_Qwen2_5_VLMoePreTrainedMod
         # Aggregate aux loss across vision/text components along batch dimension
 
         if labels is not None and weighted_aux_loss is not None:
-            loss = loss + weighted_aux_loss.to(loss.device)
+            loss = loss + aux_loss_scale * weighted_aux_loss.to(loss.device)
 
         if labels is not None and weighted_depth_aux_loss is not None:
-            loss = loss + weighted_depth_aux_loss.to(loss.device)
+            loss = loss + aux_loss_scale * weighted_depth_aux_loss.to(loss.device)
 
 
         return Flex_Qwen2_5_VLMoeCausalLMOutputWithPast(

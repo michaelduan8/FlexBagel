@@ -21,6 +21,39 @@ from transformers.configuration_utils import PretrainedConfig, layer_type_valida
 from transformers.modeling_rope_utils import rope_config_validation
 
 
+def validate_gate_row_to_expert(config) -> None:
+    """Check `gate_row_to_expert` (many-to-one routing, see GATE_ROW_TO_EXPERT.md).
+
+    The mlp.gate then has len(gate_row_to_expert) rows and row r routes to expert gate_row_to_expert[r].
+    Every expert needs at least one row; it can't be combined with use_shared_expert or always_active_expert.
+    """
+    mapping = getattr(config, "gate_row_to_expert", None)
+    aggregation = getattr(config, "gate_row_aggregation", None)
+    if aggregation not in (None, "max", "sum"):
+        raise ValueError(f"gate_row_aggregation must be None, 'max' or 'sum', got {aggregation!r}.")
+    if mapping is None:
+        if aggregation is not None:
+            raise ValueError("gate_row_aggregation requires gate_row_to_expert.")
+        return
+    num_experts = config.num_experts
+    if not isinstance(mapping, (list, tuple)) or not all(isinstance(e, int) for e in mapping):
+        raise ValueError(f"gate_row_to_expert must be a list of ints, got {mapping!r}.")
+    if any(not 0 <= e < num_experts for e in mapping):
+        raise ValueError(f"gate_row_to_expert entries must be in [0, {num_experts - 1}], got {list(mapping)}.")
+    missing = sorted(set(range(num_experts)) - set(mapping))
+    if missing:
+        raise ValueError(f"gate_row_to_expert gives no gate row to expert(s) {missing}.")
+    if getattr(config, "use_shared_expert", False):
+        raise ValueError("gate_row_to_expert cannot be combined with use_shared_expert.")
+    if getattr(config, "always_active_expert", None) is not None:
+        raise ValueError("gate_row_to_expert cannot be combined with always_active_expert.")
+    if config.num_experts_per_tok > num_experts:
+        raise ValueError(
+            f"num_experts_per_tok={config.num_experts_per_tok} exceeds num_experts={num_experts}; with "
+            "gate_row_to_expert, top-k is taken over distinct experts."
+        )
+
+
 class Flex_Qwen2_5_VLMoeVisionConfig(PretrainedConfig):
     model_type = "flex_qwen2_5_vl_moe_vision"
     base_config_key = "vision_config"
@@ -49,6 +82,10 @@ class Flex_Qwen2_5_VLMoeVisionConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_depth_aux_loss_coef=0.0,
+        use_shared_expert=False,
+        always_active_expert=None,
+        gate_row_to_expert=None,
+        gate_row_aggregation=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -75,6 +112,18 @@ class Flex_Qwen2_5_VLMoeVisionConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_depth_aux_loss_coef = router_depth_aux_loss_coef
+        # If True, mlp.shared_expert is always active and mlp.gate has num_experts + 1 rows,
+        # with row 0 giving the shared expert's logit. num_experts counts routed experts only.
+        self.use_shared_expert = use_shared_expert
+        # Eval convenience for models without a shared expert: index of an existing routed expert that is
+        # always active (weighted by its softmax prob); num_experts_per_tok are chosen among the others.
+        self.always_active_expert = always_active_expert
+        # Many-to-one routing (see GATE_ROW_TO_EXPERT.md): None = one gate row per expert (default).
+        self.gate_row_to_expert = gate_row_to_expert
+        # How an expert's routing weight is formed from its gate rows' softmax probs: None / "max" = its best
+        # row (default, the original behaviour); "sum" = the sum of its rows' probs (GATE_ROW_TO_EXPERT.md).
+        self.gate_row_aggregation = gate_row_aggregation
+        validate_gate_row_to_expert(self)
 
 
 class Flex_Qwen2_5_VLMoeTextConfig(PretrainedConfig):
@@ -135,7 +184,12 @@ class Flex_Qwen2_5_VLMoeTextConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_depth_aux_loss_coef=0.0,
+        use_shared_expert=False,
+        always_active_expert=None,
+        gate_row_to_expert=None,
+        gate_row_aggregation=None,
         mlp_only_layers=[],
+        pad_token_id=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -194,9 +248,24 @@ class Flex_Qwen2_5_VLMoeTextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_depth_aux_loss_coef = router_depth_aux_loss_coef
+        # If True, mlp.shared_expert is always active and mlp.gate has num_experts + 1 rows,
+        # with row 0 giving the shared expert's logit. num_experts counts routed experts only.
+        self.use_shared_expert = use_shared_expert
+        # Eval convenience for models without a shared expert: index of an existing routed expert that is
+        # always active (weighted by its softmax prob); num_experts_per_tok are chosen among the others.
+        self.always_active_expert = always_active_expert
+        # Many-to-one routing (see GATE_ROW_TO_EXPERT.md): None = one gate row per expert (default).
+        self.gate_row_to_expert = gate_row_to_expert
+        # How an expert's routing weight is formed from its gate rows' softmax probs: None / "max" = its best
+        # row (default, the original behaviour); "sum" = the sum of its rows' probs (GATE_ROW_TO_EXPERT.md).
+        self.gate_row_aggregation = gate_row_aggregation
+        validate_gate_row_to_expert(self)
         self.mlp_only_layers = mlp_only_layers
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        # transformers>=5 no longer defines pad_token_id on PretrainedConfig; set it after
+        # super().__init__ so transformers 4.x doesn't reset it to None.
+        self.pad_token_id = pad_token_id
 
 
 class Flex_Qwen2_5_VLMoeConfig(PretrainedConfig):

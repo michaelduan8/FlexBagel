@@ -12,13 +12,15 @@ import wandb
 import json
 
 from dataclasses import dataclass, field
-from datasets import load_dataset, Dataset, concatenate_datasets, Image, Sequence, Value
+from datasets import load_dataset, Dataset, concatenate_datasets, Features, Image, Sequence, Value
 from datetime import datetime
 from dotenv import load_dotenv
+from accelerate import PartialState
 # from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image as PILImage
 from PIL import ImageFile
 import struct
+import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForImageTextToText, HfArgumentParser, TrainerCallback, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from trl import SFTTrainer, SFTConfig
 from modeling.flex_qwen2_5_vl_moe import Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration
@@ -108,6 +110,11 @@ class SFTArgs:
         metadata={"help": "If set, freeze all weights except this expert's FFN and router row. "
                           "If use_lora is also set, LoRA is applied only to this expert's modules."}
     )
+    unfreeze_routers: bool = field(
+        default=False,
+        metadata={"help": "With train_expert_idx, train every row of the text and vision router gates instead of "
+                          "only the target expert's row (skips the router gradient mask). Expert FFN freezing is unchanged."}
+    )
     router_tuning_only: bool = field(
         default=False,
         metadata={"help": "If set, freeze all weights except MoE router gate weights across all experts. "
@@ -125,6 +132,13 @@ class SFTArgs:
         default=False,
         metadata={"help": "If set, unfreeze all parameters that do not belong to FFN/MLP layers after expert/router freezing and before LoRA setup."}
     )
+    trainable_params_fp32: bool = field(
+        default=False,
+        metadata={"help": "Keep trainable parameters in float32 (master weights) while frozen ones stay in the load "
+                          "dtype; forward/backward still run under bf16/fp16 autocast. Without it, AdamW updates bf16 "
+                          "weights directly and steps smaller than ~0.4% of a weight round away. The final model is "
+                          "cast back to the load dtype before saving."}
+    )
     freeze_lm_decoder: bool = field(
         default=False,
         metadata={"help": "If set, freeze the language-model decoder parameters so they receive no gradient updates. "
@@ -137,6 +151,17 @@ class SFTArgs:
 
     # LoRA parameters
     use_lora: bool = field(default=False, metadata={"help": "Enable LoRA training"})
+    default_video_fps: float = field(
+        default=2.0,
+        metadata={"help": "Frame rate for video rows without a video_fps value (sets Qwen2.5-VL's second_per_grid_ts). "
+                          "Only used when the training data has a `videos` column."}
+    )
+    supervise_all_assistant_turns: bool = field(
+        default=False,
+        metadata={"help": "Multi-turn rows: compute loss on every assistant turn (content + <|im_end|>), not only the "
+                          "last one. User turns, image/video tokens and role headers stay masked. Single-turn rows "
+                          "get identical labels either way. See train/multiturn_mask.py."}
+    )
     lora_r: int = field(default=16, metadata={"help": "LoRA rank (dimension of low-rank matrices)"})
     lora_alpha: int = field(default=32, metadata={"help": "LoRA alpha (scaling factor)"})
     lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout probability"})
@@ -306,8 +331,35 @@ def register_local_architectures():
     AutoModelForImageTextToText.register(Flex_Qwen2_5_VLMoeConfig, Flex_Qwen2_5_VLMoeForConditionalGeneration)
 
 
-def preprocess_dataset(dataset):
-    """Convert dataset to conversational prompt-completion format for SFTTrainer."""
+def _default_map_num_proc(num_rows):
+    """Workers for dataset.map().
+
+    Honors FLEXBAGEL_MAP_NUM_PROC; otherwise uses half the visible CPUs, capped at 16.
+    Under data parallel only one rank runs map() (see prepare_datasets), so the whole
+    box is available. Returns None for small datasets, where process spawn +
+    shard-merge cost exceeds the win.
+    """
+    override = os.environ.get("FLEXBAGEL_MAP_NUM_PROC")
+    if override is not None:
+        n = int(override)
+        return n if n > 1 else None
+
+    if num_rows < 5000:
+        return None
+    n = min(16, (os.cpu_count() or 1) // 2)
+    return n if n > 1 else None
+
+
+def preprocess_dataset(dataset, map_num_proc=None, with_videos=False, with_length=False):
+    """Convert dataset to conversational prompt-completion format for SFTTrainer.
+
+    with_videos adds `videos` (frame paths per video) and `video_fps` columns, with
+    {"type": "video"} placeholders after the image placeholders; set it for every
+    dataset of a run that has any video data so the features match for concatenation.
+    with_length keeps the integer `length` column (for --group_by_length).
+    """
+    if map_num_proc is None:
+        map_num_proc = _default_map_num_proc(len(dataset))
 
     def load_bytes(item):
         assert "images" in item, "Item must contain 'images' key"
@@ -318,21 +370,22 @@ def preprocess_dataset(dataset):
         sizes = []
 
         for img_path in item["images"]:
-            try:
-                with open(img_path, "rb") as f:
-                    img_bytes = f.read()
+            assert os.path.exists(img_path)
+            # try:
+            with open(img_path, "rb") as f:
+                img_bytes = f.read()
 
-                with PILImage.open(io.BytesIO(img_bytes)) as img:
-                    width, height = img.size
-                    widths.append(width)
-                    heights.append(height)
-                    size_mb = len(img_bytes) / (1024 * 1024)
-                    sizes.append(size_mb)
+            with PILImage.open(io.BytesIO(img_bytes)) as img:
+                width, height = img.size
+                widths.append(width)
+                heights.append(height)
+                size_mb = len(img_bytes) / (1024 * 1024)
+                sizes.append(size_mb)
 
-                loaded.append(img_bytes)
-            except Exception as e:
-                print(f"Error loading image {img_path}: {e}")
-                loaded.append(None)
+            loaded.append(img_bytes)
+            # except Exception as e:
+            #     print(f"Error loading image {img_path}: {e}")
+            #     loaded.append(None)
 
         item["image_bytes"] = loaded
         item["image_widths"] = widths
@@ -373,55 +426,130 @@ def preprocess_dataset(dataset):
         # except Exception as e:
         #     print(f"Error processing image bytes for item {item['id']}: {e}")
 
-        if "prompt_id" in item:
-            id = item["prompt_id"]
-        elif "id" in item:
-            id = item["id"]
-        else:
-            id = idx
+    # Set FLEXBAGEL_VERIFY_IMAGE_PATHS=1 to re-enable the per-image os.path.exists()
+    # check. It is one network stat() per image, which dominates map() runtime on
+    # remote/network filesystems (Modal volumes, NFS). Missing paths still fail loudly
+    # at collate time, so this is a debugging aid rather than a correctness guard.
+    verify_paths = os.environ.get("FLEXBAGEL_VERIFY_IMAGE_PATHS", "0") == "1"
 
-        conversation = item["conversation"]
-        assert conversation[-1]["role"] == "assistant"
-        # assert len(conversation) <= 3
+    def convert_batch(batch, indices):
+        """Batched version of the row converter.
 
-        images = item[image_key]
+        Rows without images are dropped here instead of in a separate .filter()
+        pass, and the output features are declared up front so no .cast_column()
+        rewrite of the table is needed afterwards.
+        """
+        image_key = "images"
+        assert "conversation" in batch
+        assert image_key in batch or "videos" in batch
 
-        prompt = []
-        used_image = False
+        ids_col = batch.get("prompt_id", batch.get("id"))
+        n_rows = len(batch["conversation"])
+        images_col = batch.get(image_key) or [None] * n_rows
+        videos_col = batch.get("videos") or [None] * n_rows
+        fps_col = batch.get("video_fps") or [None] * n_rows
+        length_col = batch.get("length") if with_length else None
 
-        for turn in conversation[:-1]:
-            content = [{"type": "text", "text": turn["content"]}]
+        out_ids, out_prompts, out_completions, out_images = [], [], [], []
+        out_videos, out_fps, out_lengths = [], [], []
 
-            # Minimal multi-turn support:
-            # If a user turn has img_loc, attach the top-level images only once.
-            # This avoids duplicating image placeholders across multiple user turns.
-            if (
-                turn["role"] == "user"
-                and turn.get("img_loc") is not None
-                and images
-                and not used_image
-            ):
-                image_content = [{"type": "image"} for _ in images]
-                if turn["img_loc"] == "before":
-                    content = image_content + content
-                else:
-                    content = content + image_content
-                used_image = True
+        for i, conversation in enumerate(batch["conversation"]):
+            images = images_col[i] or []
+            videos = videos_col[i] or []
+            if not images and not videos:
+                continue
 
-            prompt.append({"role": turn["role"], "content": content})
+            assert conversation[-1]["role"] == "assistant"
 
-        return {
-            "prompt_id": id,
-            "prompt": prompt,
-            "completion": [{"role": "assistant", "content": [{"type": "text", "text": conversation[-1]["content"]}]}],
-            # TODO: could be ok to not have images?
-            # "images": [{"bytes": b, "path": None} for b in rgb_bytes] if rgb_bytes else None,
-            "images": [{"bytes": None, "path": img_path} for img_path in images] if images else None,
+            if verify_paths:
+                for img in images:
+                    assert os.path.exists(img), f"Image path does not exist: {img}"
+
+            prompt = []
+            used_image = False
+
+            for turn in conversation[:-1]:
+                content = [{"type": "text", "text": turn["content"]}]
+
+                # Minimal multi-turn support:
+                # If a user turn has img_loc, attach the top-level images only once.
+                # This avoids duplicating image placeholders across multiple user turns.
+                if (
+                    turn["role"] == "user"
+                    and turn.get("img_loc") is not None
+                    and not used_image
+                ):
+                    image_content = [{"type": "image"} for _ in images] + [{"type": "video"} for _ in videos]
+                    if turn["img_loc"] == "before":
+                        content = image_content + content
+                    else:
+                        content = content + image_content
+                    used_image = True
+
+                prompt.append({"role": turn["role"], "content": content})
+
+            out_ids.append(str(ids_col[i]) if ids_col is not None else str(indices[i]))
+            out_prompts.append(prompt)
+            out_completions.append(
+                [{"role": "assistant", "content": [{"type": "text", "text": conversation[-1]["content"]}]}]
+            )
+            out_images.append([{"bytes": None, "path": img_path} for img_path in images])
+            if with_length:
+                out_lengths.append(int(length_col[i]))
+            if with_videos:
+                out_videos.append(videos)
+                fps = fps_col[i] or [None] * len(videos)  # None -> collator default fps
+                assert len(fps) == len(videos), "video_fps must have one value per video"
+                out_fps.append(fps)
+
+        out = {
+            "prompt_id": out_ids,
+            "prompt": out_prompts,
+            "completion": out_completions,
+            "images": out_images,
         }
+        if with_videos:
+            out["videos"] = out_videos
+            out["video_fps"] = out_fps
+        if with_length:
+            out["length"] = out_lengths
+        return out
+
+    out_features = Features(
+        {
+            "prompt_id": Value("string"),
+            "prompt": [
+                {
+                    "role": Value("string"),
+                    "content": [{"type": Value("string"), "text": Value("string")}],
+                }
+            ],
+            "completion": [
+                {
+                    "role": Value("string"),
+                    "content": [{"type": Value("string"), "text": Value("string")}],
+                }
+            ],
+            "images": Sequence(Image()),
+        }
+    )
+    if with_videos:
+        out_features["videos"] = Sequence(Sequence(Value("string")))
+        out_features["video_fps"] = Sequence(Value("float32"))
+    if with_length:
+        out_features["length"] = Value("int64")
 
     #dataset = dataset.map(load_bytes, num_proc=24)
-    dataset = dataset.map(convert_row, remove_columns=dataset.column_names, num_proc=12, with_indices=True).filter(lambda x: x["images"] is not None)
-    dataset = dataset.cast_column("images", Sequence(Image())).cast_column("prompt_id", Value("string"))
+    dataset = dataset.map(
+        convert_batch,
+        batched=True,
+        batch_size=1000,
+        with_indices=True,
+        remove_columns=dataset.column_names,
+        features=out_features,
+        num_proc=map_num_proc,
+        desc="convert_row",
+    )
 
     # widths_kept = [w for row in dataset["image_widths"] for w in row]
     # heights_kept = [h for row in dataset["image_heights"] for h in row]
@@ -461,7 +589,20 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
     else:
         sample_sizes = None
 
-    loaded_dataset = []
+    # Under data parallel every rank would otherwise run the identical load + map,
+    # multiplying the work by world size and serializing the ranks on the datasets
+    # cache lock. Let the local main process build (and cache) the dataset first;
+    # the remaining ranks then hit the cache and mmap it in ~instantly.
+    #
+    # This requires a *shared, persistent* datasets cache. On Modal, point
+    # HF_DATASETS_CACHE (and HF_HOME) at a mounted Volume, otherwise every
+    # container starts cold and re-does the map on each run.
+    with PartialState().local_main_process_first():
+        return _prepare_datasets_impl(datasets, seed, sample_sizes, filter_by_id, skip_eval)
+
+
+def _prepare_datasets_impl(datasets, seed, sample_sizes, filter_by_id, skip_eval):
+    raw_datasets = []
     for idx, dataset_name in enumerate(datasets):
         print(f"Loading dataset: {dataset_name}")
 
@@ -489,8 +630,19 @@ def prepare_datasets(datasets, seed, sample_size=None, filter_by_id=None, skip_e
             
             print(f"Sampled dataset[{idx}] size: {len(dataset)}")
 
-        loaded_dataset.append(preprocess_dataset(dataset))
-    
+        raw_datasets.append(dataset)
+
+    # Video columns are added to every dataset when any has them, so the features match.
+    with_videos = any("videos" in dataset.column_names for dataset in raw_datasets)
+    if with_videos:
+        print("Video data found: adding videos/video_fps columns.")
+    # The `length` column (for --group_by_length) is kept only when every dataset has it, so the features match.
+    with_length = all("length" in dataset.column_names for dataset in raw_datasets)
+    if with_length:
+        print("Length column found in every dataset: keeping it for --group_by_length.")
+    loaded_dataset = [preprocess_dataset(dataset, with_videos=with_videos, with_length=with_length)
+                      for dataset in raw_datasets]
+
     loaded_dataset = concatenate_datasets(loaded_dataset)
 
     # Apply id substring filter before any further processing
@@ -571,6 +723,52 @@ class WandbLoggingCallback(TrainerCallback):
     #     return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     # else:
     #     return ["q_proj", "v_proj"]
+
+
+def load_model_with_routing_overrides(model_name, num_experts_per_tok, norm_topk_prob, **from_pretrained_kwargs):
+    """Load a model with the MoE routing overrides applied to its config *before* the modules are built.
+
+    The MoE blocks copy num_experts_per_tok (top_k) and norm_topk_prob from the config at construction, so setting
+    model.config afterwards changes only the saved config, not the routing used in training. Dense models (no
+    num_experts_per_tok in their sub-configs) are loaded unchanged.
+    """
+    config = AutoConfig.from_pretrained(model_name)
+    is_moe = False
+    for sub in (getattr(config, "text_config", None), getattr(config, "vision_config", None)):
+        if sub is not None and hasattr(sub, "num_experts_per_tok"):
+            sub.num_experts_per_tok = num_experts_per_tok
+            sub.norm_topk_prob = norm_topk_prob
+            is_moe = True
+    model = AutoModelForImageTextToText.from_pretrained(model_name, config=config, **from_pretrained_kwargs)
+    if is_moe:
+        blocks = [m for m in model.modules() if hasattr(m, "top_k") and hasattr(m, "gate") and hasattr(m, "experts")]
+        assert blocks, "MoE config but no MoE blocks found"
+        wrong = [(m.top_k, m.norm_topk_prob) for m in blocks
+                 if m.top_k != num_experts_per_tok or m.norm_topk_prob != norm_topk_prob]
+        assert not wrong, f"{len(wrong)} MoE blocks ignore the routing overrides, e.g. (top_k, norm) = {wrong[0]}"
+        print(f"MoE routing for training: top_k={num_experts_per_tok}, norm_topk_prob={norm_topk_prob} "
+              f"({len(blocks)} MoE blocks)")
+    return model
+
+
+def upcast_trainable_params(model) -> int:
+    """Cast every trainable parameter to float32 in place (frozen ones keep their dtype); returns how many."""
+    count = 0
+    for param in model.parameters():
+        if param.requires_grad and param.dtype != torch.float32:
+            param.data = param.data.float()
+            count += 1
+    return count
+
+
+def cast_floating_params(model, dtype) -> int:
+    """Cast floating-point parameters that are not already `dtype` to it in place; returns how many."""
+    count = 0
+    for param in model.parameters():
+        if param.is_floating_point() and param.dtype != dtype:
+            param.data = param.data.to(dtype)
+            count += 1
+    return count
 
 
 def print_trainable_parameters(model):
@@ -909,10 +1107,23 @@ class ExpertSFTTrainer(SFTTrainer):
                 if ".mlp.gate.weight" in name and param.grad is not None:
                     with torch.no_grad():
                         mask = torch.zeros_like(param.grad)
-                        mask[self.expert_idx] = 1.0
+                        rows = self._gate_rows_for_expert(name)
+                        if rows is None:
+                            mask[self.expert_idx] = 1.0
+                        else:
+                            mask[rows] = 1.0
                         param.grad *= mask
 
         return loss
+
+    def _gate_rows_for_expert(self, param_name: str):
+        """Gate rows routing to expert_idx under many-to-one routing (gate_row_to_expert); None otherwise."""
+        config = getattr(self.model, "config", None)
+        sub_config = getattr(config, "vision_config" if "visual" in param_name else "text_config", None)
+        mapping = getattr(sub_config, "gate_row_to_expert", None)
+        if mapping is None:
+            return None
+        return [row for row, expert in enumerate(mapping) if expert == self.expert_idx]
 
 
 
@@ -1229,8 +1440,12 @@ def main():
     parser = HfArgumentParser([SFTConfig, SFTArgs])
     sft_config, sft_args = parser.parse_args_into_dataclasses()
 
+    print(transformers.__version__)
     print("Parsed SFTConfig:", sft_config)
     print("SFTArgs:", sft_args)
+
+    if sft_args.unfreeze_routers and sft_args.train_expert_idx is None:
+        raise ValueError("unfreeze_routers only applies with train_expert_idx (otherwise router gates are not masked).")
 
     if sft_args.router_tuning_only and sft_args.train_expert_idx is not None:
         raise ValueError("router_tuning_only is incompatible with train_expert_idx because router tuning affects the routing gate of all experts, not just a single expert.")
@@ -1271,13 +1486,19 @@ def main():
 
     use_bf16 = torch.cuda.is_bf16_supported()
     print(f"Using {'bfloat16' if use_bf16 else 'float16'}")
-    model = AutoModelForImageTextToText.from_pretrained(
+    model = load_model_with_routing_overrides(
         model_name,
+        num_experts_per_tok=sft_args.num_experts_per_tok,
+        norm_topk_prob=sft_args.norm_topk_prob,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
         attn_implementation="flash_attention_2",
         # attn_implementation={"": "sdpa"},
         device_map=None,  # device_map conflicts with DeepSpeed, use auto if single gpu
     )
+
+    print(f"[rank{torch.distributed.get_rank()}] config id={id(model.config)} "
+        f"name_or_path={getattr(model.config, '_name_or_path', None)} "
+        f"has_vst={hasattr(model.config, 'vision_start_token_id')}", flush=True)
 
     # Set num_experts_per_tok to activate for training
     model.config.text_config.num_experts_per_tok = sft_args.num_experts_per_tok
@@ -1291,6 +1512,14 @@ def main():
     model.config.vision_config.output_router_logits = sft_args.output_router_logits
     model.config.vision_config.router_aux_loss_coef = sft_args.router_aux_loss_coef
     model.config.vision_config.router_depth_aux_loss_coef = sft_args.router_depth_aux_loss_coef
+
+    if sft_args.train_expert_idx is not None and (
+        getattr(model.config.text_config, "use_shared_expert", False)
+        or getattr(model.config.vision_config, "use_shared_expert", False)
+    ):
+        # Gate row i+1 maps to experts[i] with a shared expert, so expert freezing / gate-row
+        # masking / LoRA scoping by train_expert_idx would target the wrong expert.
+        raise NotImplementedError("train_expert_idx is not supported for models with use_shared_expert=True.")
 
     print("Loaded model class:", type(model))
     print("Config class:", type(model.config))
@@ -1462,6 +1691,23 @@ def main():
     sft_config.seed = run_seed
     sft_config.data_seed = run_seed
 
+    # --use_liger_kernel and --group_by_length are TrainingArguments flags (parsed into sft_config).
+    if sft_config.use_liger_kernel:
+        # Transformers' Trainer applies the patch to the model instance at init (needs the liger-kernel package).
+        # Only the fused linear cross-entropy: with Liger's default extra kernels (RMSNorm, SwiGLU, RoPE) the
+        # Qwen2.5-VL loss matched but the gradients did not (cosine 0.56 vs 0.995 between two standard runs, measured
+        # on a MedThinkVQA batch with gradient checkpointing), so those stay off.
+        sft_config.liger_kernel_config = {"fused_linear_cross_entropy": True, "cross_entropy": False,
+                                          "rms_norm": False, "swiglu": False, "rope": False}
+        print(f"Liger fused linear cross-entropy requested for model_type={model.config.model_type} "
+              "(applies to supported types only)")
+    if sft_config.group_by_length:
+        # Rows of similar estimated length are batched together (HF LengthGroupedSampler) to cut padding.
+        if "length" not in train_dataset.column_names:
+            raise ValueError("--group_by_length needs an integer `length` column (estimated tokens) in every training JSONL")
+        sft_config.length_column_name = "length"
+        print("group_by_length: batching rows of similar estimated length")
+
     # VLM-specific safety
     sft_config.remove_unused_columns = False
     sft_config.max_length = None
@@ -1497,12 +1743,19 @@ def main():
         "unfreeze_non_ffn": sft_args.unfreeze_non_ffn,
         "freeze_lm_decoder": sft_args.freeze_lm_decoder,
         "freeze_vision_tower": sft_args.freeze_vision_tower,
+        "unfreeze_routers": sft_args.unfreeze_routers,
         **lora_stats,
     }
 
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
+    load_dtype = next(p.dtype for p in model.parameters() if p.is_floating_point())
+    if sft_args.trainable_params_fp32:
+        if sft_args.use_lora:
+            raise NotImplementedError("trainable_params_fp32 is not wired up for LoRA.")
+        n = upcast_trainable_params(model)
+        print(f"trainable_params_fp32=True: {n} trainable tensors upcast to float32 (frozen stay {load_dtype}).")
     optimizer = build_vlm_optimizer(
         model,
         sft_config,
@@ -1511,15 +1764,48 @@ def main():
         lr_connector=sft_args.lr_connector
     )
 
+    # Video rows need a collator that forwards frames to the processor's video branch;
+    # image-only runs keep TRL's default collator.
+    data_collator = None
+    if "videos" in train_dataset.column_names:
+        # Imported lazily so launchers that copy only mm_tune.py keep working for image runs.
+        from train.video_collator import VideoAwareVLMCollator
+
+        data_collator = VideoAwareVLMCollator(
+            processor=processor,
+            max_length=sft_config.max_length,
+            completion_only_loss=sft_config.completion_only_loss,
+            dataset_text_field=sft_config.dataset_text_field,
+            default_video_fps=sft_args.default_video_fps,
+        )
+        print(f"Using VideoAwareVLMCollator (default_video_fps={sft_args.default_video_fps})")
+
+    if sft_args.supervise_all_assistant_turns:
+        from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
+        from train.multiturn_mask import AllAssistantTurnsCollator
+
+        if data_collator is None:  # same construction as SFTTrainer's default for VLM data
+            data_collator = DataCollatorForVisionLanguageModeling(
+                processor=processor,
+                max_length=sft_config.max_length,
+                completion_only_loss=sft_config.completion_only_loss,
+                pad_to_multiple_of=sft_config.pad_to_multiple_of,
+                dataset_text_field=sft_config.dataset_text_field,
+            )
+        data_collator = AllAssistantTurnsCollator(data_collator, processor.tokenizer)
+        print("supervise_all_assistant_turns=True: loss on every assistant turn")
+
     trainer = ExpertSFTTrainer(
         model=model,
+        data_collator=data_collator,
         args=sft_config,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         processing_class=processor,
         optimizers=(optimizer, None),  # let Trainer create scheduler only if you handle it separately
         callbacks=[WandbLoggingCallback(wandb_stats)],
-        expert_idx=sft_args.train_expert_idx,
+        # expert_idx drives the router-row gradient mask; None leaves all router rows trainable
+        expert_idx=None if sft_args.unfreeze_routers else sft_args.train_expert_idx,
     )
 
     # Materialize the fixed resume checkpoint after Trainer/Accelerate exists, so
@@ -1548,8 +1834,10 @@ def main():
 
     assert batch["input_ids"].ndim == 2, batch["input_ids"].shape
     assert batch["attention_mask"].ndim == 2, batch["attention_mask"].shape
-    assert "pixel_values" in batch, batch.keys()
-    assert "image_grid_thw" in batch, batch.keys()
+    # Every batch needs visual input: images, videos (video runs), or both
+    assert ("pixel_values" in batch and "image_grid_thw" in batch) or (
+        "pixel_values_videos" in batch and "video_grid_thw" in batch
+    ), batch.keys()
     # dataset = trainer.train_dataset
     # print(dataset[0])
     # quit()
@@ -1575,6 +1863,9 @@ def main():
             processor.save_pretrained(final_output_dir)
             print(f"Merged model saved to {final_output_dir}")
         else:
+            if sft_args.trainable_params_fp32:
+                n = cast_floating_params(trainer.accelerator.unwrap_model(trainer.model), load_dtype)
+                print(f"trainable_params_fp32: cast {n} float32 tensors back to {load_dtype} before saving.")
             trainer.save_model(output_dir=final_output_dir)
             tokenizer.save_pretrained(final_output_dir)
             processor.save_pretrained(final_output_dir)
