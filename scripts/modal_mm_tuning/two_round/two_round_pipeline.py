@@ -130,9 +130,10 @@ def mm_tune(run_id: str, model: str, data: str, output_dir: str, extra: list[str
 
 @app.function(image=image, volumes=VOLUMES, secrets=SECRETS, gpu=TRAIN_GPU, cpu=24,
               timeout=int(TIMEOUT_HOURS * 60 * 60))
-def train_round1(tag: str, round1_tag: str, silo: str, lr: float):
+def train_round1(tag: str, round1_tag: str, silo: str, lr: float, extra_args: tuple = (), per_device_batch: int = 8):
     p = paths(tag, round1_tag)
-    mm_tune(p[silo]["round1_run"], BASE_MODEL, p[silo]["data1"], f"{p['root1']}/round1/", [], lr)
+    mm_tune(p[silo]["round1_run"], BASE_MODEL, p[silo]["data1"], f"{p['root1']}/round1/", list(extra_args), lr,
+            per_device_batch=per_device_batch)
 
 
 @app.function(image=image, volumes=VOLUMES, secrets=SECRETS, gpu=TRAIN_GPU, cpu=24,
@@ -293,7 +294,9 @@ def pipeline(cfg: dict):
         split_data.remote(tag, round1_tag, cfg["data_mode"], cfg["round1_fraction"], cfg["round2_fraction"],
                           cfg["seed"])
     if "round1" in stages:
-        per_silo(train_round1, [(tag, round1_tag, s, cfg["round1_lr"]) for s in silos if not done(p[s]["round1_final"])],
+        per_silo(train_round1, [(tag, round1_tag, s, cfg["round1_lr"], tuple(cfg.get("round1_extra_args", ())),
+                                 cfg.get("round1_per_device_batch", 8))
+                                for s in silos if not done(p[s]["round1_final"])],
                  cfg["parallel"])
     if "hidden" in stages:
         vol_output.reload()
@@ -316,7 +319,8 @@ def pipeline(cfg: dict):
 def main(tag: str, round1_tag: str = "", stages: str = ",".join(ALL_STAGES), data_mode: str = "halves",
          round1_fraction: float = 0.5, round2_fraction: float = 0.0, seed: int = 42, round1_lr: float = 2e-5, round2_lr: float = 2e-5, round2_topk: int = 3,
          upcycle_topk: int = 2, hidden_queries: int = 1000, parallel: bool = False, silos: str = "",
-         round2_warmup_ratio: float = 0.1, round2_extra_args: str = "", round2_per_device_batch: int = 8):
+         round2_warmup_ratio: float = 0.1, round2_extra_args: str = "", round2_per_device_batch: int = 8,
+         round1_extra_args: str = "", round1_per_device_batch: int = 8):
     stage_list = [s for s in stages.split(",") if s]
     assert set(stage_list) <= set(ALL_STAGES), f"unknown stage in {stage_list}; choose from {ALL_STAGES}"
     silo_list = [s for s in silos.split(",") if s] or list(SILOS)
@@ -331,7 +335,9 @@ def main(tag: str, round1_tag: str = "", stages: str = ",".join(ALL_STAGES), dat
                round1_lr=round1_lr, round2_lr=round2_lr, round2_topk=round2_topk, upcycle_topk=upcycle_topk,
                hidden_queries=hidden_queries, parallel=parallel, silos=silo_list,
                round2_warmup_ratio=round2_warmup_ratio, round2_extra_args=round2_extra_args.split(),
-               round2_per_device_batch=round2_per_device_batch)
+               round2_per_device_batch=round2_per_device_batch,
+               round1_extra_args=round1_extra_args.split(), round1_per_device_batch=round1_per_device_batch)
+    assert 48 % round1_per_device_batch == 0, "per-device batch must divide 48 (effective batch 192 on 4 GPUs)"
     assert 48 % round2_per_device_batch == 0, "per-device batch must divide 48 (effective batch 192 on 4 GPUs)"
     assert 0 <= round2_warmup_ratio < 1, round2_warmup_ratio
     assert not (cfg["round2_extra_args"] and "merge" in stage_list), \
